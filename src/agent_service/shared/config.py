@@ -21,4 +21,4 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     # Cached so Settings() — which reads the environment and .env file — only
     # runs once per process, not on every request that needs config.
-    return Settings()  # type: ignore[call-arg]
+    return Settings()

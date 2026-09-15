@@ -1,15 +1,15 @@
-"""Tool business logic and Claude tool-schema definitions.
+"""Tool business logic and input models — framework-agnostic.
 
-Each tool's input is a Pydantic model rather than a hand-written JSON Schema
-dict — model_json_schema() generates the schema Claude sees directly from the
-same type that validates the input at call time, so the two can't drift apart
-the way a hand-maintained schema and a hand-maintained type hint could.
+Used by both direct_api/tools.py (wrapped as Claude ToolParam + dispatch)
+and langchain/tools.py (wrapped as LangChain @tool objects), so both
+implementations are doing identical work underneath. Pydantic models are
+shared too: direct_api generates Claude's JSON Schema straight off them via
+model_json_schema(), and langchain passes them as a tool's args_schema
+directly — no framework needs a hand-written schema duplicating the model.
 """
 
 import random
-from typing import Any
 
-from anthropic.types import ToolParam
 from pydantic import BaseModel, Field
 
 from .exceptions import TransientToolError
@@ -85,63 +85,3 @@ def send_notification(input: SendNotificationInput) -> str:
     if random.random() < 0.3:
         raise TransientToolError(f'notification service temporarily unavailable for user "{input.user_id}"')
     return f'Notification sent to {input.user_id}: "{input.message}"'
-
-
-TOOL_DEFINITIONS: list[ToolParam] = [
-    ToolParam(
-        name="lookup_order_status",
-        description="Look up the current status of a customer order by its order ID.",
-        input_schema=LookupOrderStatusInput.model_json_schema(),
-    ),
-    ToolParam(
-        name="search_knowledge_base",
-        description="Search the internal support knowledge base for articles matching a query.",
-        input_schema=SearchKnowledgeBaseInput.model_json_schema(),
-    ),
-    ToolParam(
-        name="send_notification",
-        description="Send a notification message to a user, e.g. to tell them about their order.",
-        input_schema=SendNotificationInput.model_json_schema(),
-    ),
-]
-
-_TOOL_INPUT_MODELS: dict[str, type[BaseModel]] = {
-    "lookup_order_status": LookupOrderStatusInput,
-    "search_knowledge_base": SearchKnowledgeBaseInput,
-    "send_notification": SendNotificationInput,
-}
-
-_TOOL_FUNCTIONS: dict[str, Any] = {
-    "lookup_order_status": lookup_order_status,
-    "search_knowledge_base": search_knowledge_base,
-    "send_notification": send_notification,
-}
-
-
-def run_tool(name: str, raw_input: dict[str, Any], allowed_tools: list[str] | None = None) -> str:
-    """Pure dispatch: validate Claude's chosen input against the matching
-    Pydantic model, then call the matching function.
-
-    allowed_tools is the actual permissions boundary for a given agent run —
-    None means "no restriction". The agent loop also filters which tool
-    schemas it shows Claude based on the same list, but that's just UX
-    (Claude won't try to use what it can't see); this check is what actually
-    stops a call from running, independent of whether that filtering
-    happened, was bypassed, or Claude was talked into requesting a
-    disallowed tool anyway (e.g. via a prompt injection).
-    """
-    if allowed_tools is not None and name not in allowed_tools:
-        return f'Error: tool "{name}" is not permitted for this agent run'
-
-    model = _TOOL_INPUT_MODELS.get(name)
-    func = _TOOL_FUNCTIONS.get(name)
-    if model is None or func is None:
-        return f'Error: unknown tool "{name}"'
-
-    try:
-        validated_input = model.model_validate(raw_input)
-    except Exception as exc:
-        return f"Error: invalid input for tool \"{name}\": {exc}"
-
-    result: str = func(validated_input)
-    return result

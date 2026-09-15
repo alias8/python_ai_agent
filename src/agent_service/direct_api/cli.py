@@ -5,9 +5,9 @@ import asyncio
 
 from anthropic import AsyncAnthropic
 
+from ..shared.config import get_settings
+from ..shared.trace import get_trace_file_path
 from .agent import run_agent
-from .config import get_settings
-from .trace import get_trace_file_path
 
 
 async def _main() -> None:

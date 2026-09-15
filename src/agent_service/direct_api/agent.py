@@ -21,10 +21,9 @@ from tenacity import (
     wait_exponential,
 )
 
-from .config import get_settings
-from .exceptions import TransientToolError
-from .tools import TOOL_DEFINITIONS, run_tool
-from .trace import (
+from ..shared.config import get_settings
+from ..shared.exceptions import TransientToolError
+from ..shared.trace import (
     trace_api_error,
     trace_final_answer,
     trace_loop_detected,
@@ -32,6 +31,7 @@ from .trace import (
     trace_tool_call,
     trace_tool_retry,
 )
+from .tools import TOOL_DEFINITIONS, run_tool
 
 MAX_ITERATIONS = 8
 MAX_TOOL_RETRIES = 2  # up to 3 attempts total per tool call

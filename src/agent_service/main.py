@@ -4,10 +4,10 @@ from typing import Any
 from anthropic import AsyncAnthropic
 from fastapi import FastAPI
 
-from .agent import run_agent
-from .config import get_settings
+from .direct_api.agent import run_agent
 from .schemas import ChatRequest, ChatResponse
-from .trace import get_trace_file_path
+from .shared.config import get_settings
+from .shared.trace import get_trace_file_path
 
 _clients: dict[str, AsyncAnthropic] = {}
 

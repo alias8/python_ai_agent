@@ -2,6 +2,11 @@
 
 The Python/FastAPI sibling of [`ai-agent-demo`](../ai-agent-demo) — the same Claude tool-calling agentic loop (reason, call a tool, observe the result, repeat), rebuilt with a production-style Python stack instead of TypeScript.
 
+Two implementations of that loop, same tools and system prompt, so the difference is visible side by side instead of theoretical:
+
+- **`src/agent_service/direct_api/`** — built directly on the Anthropic Python SDK's tool use feature: the FastAPI service (`/chat`) and the production-readiness ports below.
+- **`src/agent_service/langchain/`** — the same three tools via LangChain's current `create_agent()`, mirroring `ai-agent-demo`'s own `src/langchain/` comparison.
+
 ## Why this exists
 
 `ai-agent-demo` answered "what experience do you have building AI agents?" for TypeScript. This project exists to answer the natural follow-up honestly: several Boston-area senior full-stack postings want the same agent/backend work done in Python specifically (FastAPI, Pydantic, async, AI/LLM integration), and side-project familiarity with the language isn't the same claim as production backend experience in it. This is that — the same loop, same production-readiness ports, built with the type-safety and tooling a real Python backend job would expect.
@@ -17,49 +22,75 @@ Python's type hints aren't enforced at runtime the way Kotlin's are — `mypy` c
 
 ```
 src/agent_service/
-  config.py       Settings via pydantic-settings — fails fast on a missing ANTHROPIC_API_KEY
-  exceptions.py   TransientToolError
-  tools.py        Pydantic-modeled tool inputs, tool business logic, run_tool() dispatch
-  trace.py        JSONL tracing, ported from ai-agent-demo's shared/trace.ts
-  agent.py        the agentic loop: retry/backoff (tenacity), loop detection, tool scoping
-  schemas.py      API request/response models
-  main.py         FastAPI app (/health, /chat)
-  cli.py          REPL entry point, same shape as ai-agent-demo's CLI
-tests/            pytest + pytest-asyncio, Anthropic API mocked via a fake client
+  shared/
+    config.py       Settings via pydantic-settings — fails fast on a missing ANTHROPIC_API_KEY
+    exceptions.py   TransientToolError
+    tools_core.py   Pydantic-modeled tool inputs + tool business logic — framework-agnostic
+    trace.py        JSONL tracing, ported from ai-agent-demo's shared/trace.ts, used by both implementations
+  direct_api/
+    tools.py         wraps tools_core as Claude ToolParam definitions + run_tool() dispatch
+    agent.py         the agentic loop: retry/backoff (tenacity), loop detection, tool scoping
+    cli.py           REPL entry point, same shape as ai-agent-demo's direct-api CLI
+  langchain/
+    tools.py         wraps tools_core as LangChain @tool objects, with the same JSONL tracing
+    agent.py         the same job via create_agent()
+    cli.py           REPL entry point, same shape as direct_api's
+  schemas.py        API request/response models
+  main.py           FastAPI app (/health, /chat) — runs on direct_api, LangChain is CLI-only
+tests/              pytest + pytest-asyncio, Anthropic API mocked via a fake client
 ```
 
 ## Tools implemented
 
-A customer-support flavor rather than ai-agent-demo's calculator/weather/units, chosen to be a distinct demo rather than a port of the same three tools:
+A customer-support flavor rather than ai-agent-demo's calculator/weather/units, chosen to be a distinct demo rather than a port of the same three tools. Defined once in `shared/tools_core.py` and wrapped in each implementation's own schema format (a Claude `ToolParam` built from `model_json_schema()` for `direct_api`, the same Pydantic model passed straight in as a LangChain tool's `args_schema` for `langchain`) so both implementations are doing identical work underneath:
 
 - `lookup_order_status(order_id)` — mock order lookup; simulates the backing service being flaky (~40% of calls raise a retryable `TransientToolError`)
 - `search_knowledge_base(query)` — keyword search over a small in-memory article set
 - `send_notification(user_id, message)` — a mock action tool with a side effect, independently flaky (~30%)
 
+## How langchain/ works
+
+```python
+_agent = create_agent(model=_model, tools=LANGCHAIN_TOOLS, system_prompt=SYSTEM_PROMPT)
+result = await _agent.ainvoke({"messages": [{"role": "user", "content": user_message}]})
+```
+
+That's the entire loop. `create_agent()` (from the `langchain` package, matching `ai-agent-demo`'s TypeScript `createAgent()`) builds a LangGraph state machine that does everything `direct_api/agent.py` spells out by hand: the growing message list, the tool_use/tool_result wiring, the loop-until-no-more-tool-calls condition. None of `direct_api`'s other production-readiness ports (retry/backoff, tool scoping) are reimplemented here on purpose, to keep the comparison focused on what the framework gives you unmodified.
+
+## What happens on a tool failure (tested, not assumed)
+
+`lookup_order_status`'s simulated ~40% failure rate turned out to be a good way to observe each implementation's default behavior rather than guess at it from docs:
+
+- **direct_api** — a thrown `TransientToolError` is retried up to 3 times with exponential backoff via `tenacity`; only gives up and surfaces an error to Claude after exhausting retries.
+- **langchain** — this is the interesting one, and it's the opposite of `ai-agent-demo`'s TypeScript finding. LangChain.js's `ToolNode` catches a thrown error by default and turns it into an error `ToolMessage`, no crash. LangGraph's *Python* `ToolNode` does not: its default `handle_tool_errors` handler (`langgraph.prebuilt.tool_node._default_handle_tool_errors`) only catches its own `ToolInvocationError` (malformed tool-call arguments) — any exception raised from inside the tool itself, `TransientToolError` included, propagates straight up through `agent.ainvoke()` and crashes the whole run. Confirmed by driving `create_agent()` with a scripted fake chat model (no network) and watching a raised `TransientToolError` blow past the graph instead of becoming a message. `create_agent()` builds its `ToolNode` without overriding this, so it inherits the crash-by-default behavior unmodified. Opting into "don't crash" means passing `handle_tool_errors=True` (or a handler) directly to a `ToolNode` — not exposed as a `create_agent()` parameter, so it isn't wired up here, matching this comparison's rule of only using what each framework gives you unmodified.
+
+The TypeScript and Python LangChain ecosystems don't even agree with each other on what "the default" is for the exact same framework concept — that's the real finding here, and a sharper one than either single language would have surfaced alone.
+
 ## Running it
 
 ```
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev]"        # includes langchain + langchain-anthropic
 cp .env.example .env   # add your ANTHROPIC_API_KEY
 
-# HTTP API
+# HTTP API (direct_api only)
 uvicorn agent_service.main:app --reload
 # then: POST /chat {"message": "..."}  — docs at /docs
 
-# or the REPL, same shape as ai-agent-demo's CLI
-python -m agent_service.cli
+# or a REPL, same shape as ai-agent-demo's CLIs
+python -m agent_service.direct_api.cli
+python -m agent_service.langchain.cli
 ```
 
 ## Checks
 
 ```
 ruff check .      # lint
-mypy              # strict type check
+mypy              # strict type check — includes pydantic's mypy plugin, needed for LangChain's Pydantic-based model classes
 pytest -q         # unit + integration tests (fake Anthropic client, no network/API key needed)
 ```
 
-All three run in CI on every push/PR (`.github/workflows/ci.yml`).
+All three run in CI on every push/PR (`.github/workflows/ci.yml`). There's no automated test for `langchain/agent.py`'s full `create_agent()` run (mocking LangGraph's internals deep enough to be worth it wasn't — the tool-failure finding above was verified with a one-off scripted fake model instead, not committed as a test); `langchain/tools.py`'s tool wrapping is unit-tested like everything else.
 
 ## Status
 
