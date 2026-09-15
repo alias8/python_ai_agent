@@ -14,6 +14,15 @@ from pydantic import BaseModel, Field
 
 from .exceptions import TransientToolError
 
+# Toggle the tools' simulated flaky-service failures below. On by design —
+# it's what exercises direct_api's retry/backoff path and is how the
+# langchain/ vs. ai-agent-demo's TS langchain/ tool-error-handling difference
+# documented in the README was actually found, rather than assumed from
+# docs. Set to False when you want a deterministic run, e.g. stepping
+# through the happy path in a debugger without a ~40%/~30% chance of
+# instead landing in the crash path on every call.
+SIMULATE_TOOL_FAILURES = False
+
 
 class LookupOrderStatusInput(BaseModel):
     order_id: str = Field(..., description='Order ID to look up, e.g. "ORD-1042"')
@@ -40,7 +49,7 @@ def lookup_order_status(input: LookupOrderStatusInput) -> str:
     # an unknown order ID (handled below, and not an error — just "not
     # found"). This is the "tool is down" case a retry can plausibly fix, as
     # opposed to "tool call was wrong."
-    if random.random() < 0.4:
+    if SIMULATE_TOOL_FAILURES and random.random() < 0.4:
         raise TransientToolError(f'order service temporarily unavailable for "{input.order_id}"')
 
     order = _MOCK_ORDERS.get(input.order_id.strip().lower())
@@ -82,6 +91,6 @@ def send_notification(input: SendNotificationInput) -> str:
     # action with a side effect, rather than a read. Retrying this one is
     # only safe because the mock "notification service" is idempotent per
     # call in this demo — a real one would need a dedupe key to retry safely.
-    if random.random() < 0.3:
+    if SIMULATE_TOOL_FAILURES and random.random() < 0.3:
         raise TransientToolError(f'notification service temporarily unavailable for user "{input.user_id}"')
     return f'Notification sent to {input.user_id}: "{input.message}"'
