@@ -12,7 +12,7 @@ MODEL = "fake-model"
 
 
 def _chunk(chunk_id: str, text: str) -> Chunk:
-    return Chunk(id=chunk_id, article_id="a", article_title="A", heading="", text=text)
+    return Chunk(id=chunk_id, store_id="s", article_id="s/a", article_title="A", heading="", text=text)
 
 
 class FakeEmbedder:

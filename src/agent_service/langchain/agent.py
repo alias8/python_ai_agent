@@ -22,6 +22,7 @@ from pydantic import SecretStr
 
 from ..shared.config import get_settings
 from ..shared.trace import trace_api_error, trace_final_answer, trace_max_iterations
+from .context import AgentContext
 from .tools import LANGCHAIN_TOOLS, reset_call_sequence
 
 # LangGraph's own default. It counts each graph "super-step" (roughly: one
@@ -71,7 +72,9 @@ def _get_agent(tool_names: tuple[str, ...]) -> Any:
     # One compiled graph per distinct allowlist, cached, since building one
     # isn't free and the set of allowlists in practice is small.
     tools = [_TOOLS_BY_NAME[name] for name in tool_names]
-    return create_agent(model=_model, tools=tools, system_prompt=SYSTEM_PROMPT)
+    return create_agent(
+        model=_model, tools=tools, system_prompt=SYSTEM_PROMPT, context_schema=AgentContext
+    )
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -86,9 +89,13 @@ def _message_text(message: BaseMessage) -> str:
 
 async def run_agent(
     user_message: str,
+    store_id: str,
     on_step: OnStep | None = None,
     allowed_tools: Sequence[str] | None = None,
 ) -> str:
+    """store_id scopes the run to one store (tenant). It's the caller's job
+    to establish it — from the authenticated request, never from the user's
+    message — and it reaches tools only through AgentContext."""
     agent = _get_agent(select_tools(allowed_tools))
     reset_call_sequence()
 
@@ -96,6 +103,7 @@ async def run_agent(
         result = await agent.ainvoke(
             {"messages": [{"role": "user", "content": user_message}]},
             {"recursion_limit": RECURSION_LIMIT},
+            context=AgentContext(store_id=store_id),
         )
     except GraphRecursionError:
         # The loop never produced a final answer within RECURSION_LIMIT

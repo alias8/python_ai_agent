@@ -31,7 +31,8 @@ _SECTION_HEADING = re.compile(r"^## (.+)$", flags=re.MULTILINE)
 
 @dataclass(frozen=True)
 class Chunk:
-    id: str  # "<article id>#<n>", e.g. "returns-and-refunds#3"
+    id: str  # "<article id>#<n>", e.g. "main-street-market/returns-and-refunds#3"
+    store_id: str
     article_id: str
     article_title: str
     heading: str  # the section heading, or "" for the article's intro
@@ -87,6 +88,7 @@ def chunk_article(
             chunks.append(
                 Chunk(
                     id=f"{article.id}#{len(chunks)}",
+                    store_id=article.store_id,
                     article_id=article.id,
                     article_title=article.title,
                     heading=heading,

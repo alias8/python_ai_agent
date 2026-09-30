@@ -11,6 +11,7 @@ def _words(text: str) -> int:
 
 ARTICLE = KBArticle(
     id="widgets",
+    store_id="store",
     title="Widgets",
     body=(
         "Intro paragraph about widgets.\n\n"

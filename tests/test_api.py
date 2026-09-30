@@ -26,7 +26,7 @@ def test_chat_endpoint_returns_agent_answer(client: TestClient, monkeypatch: pyt
         return "mocked answer"
 
     monkeypatch.setattr("agent_service.main.run_agent", fake_run_agent)
-    response = client.post("/chat", json={"message": "where is my order?"})
+    response = client.post("/chat", json={"message": "where is my order?", "store_id": "main-street-market"})
     assert response.status_code == 200
     body = response.json()
     assert body["answer"] == "mocked answer"
@@ -34,7 +34,7 @@ def test_chat_endpoint_returns_agent_answer(client: TestClient, monkeypatch: pyt
 
 
 def test_chat_endpoint_rejects_empty_message(client: TestClient) -> None:
-    response = client.post("/chat", json={"message": ""})
+    response = client.post("/chat", json={"message": "", "store_id": "main-street-market"})
     assert response.status_code == 422
 
 
@@ -47,13 +47,29 @@ def test_chat_endpoint_passes_allowlist_to_agent(client: TestClient, monkeypatch
 
     monkeypatch.setattr("agent_service.main.run_agent", fake_run_agent)
     response = client.post(
-        "/chat", json={"message": "hi", "allowed_tools": ["search_knowledge_base"]}
+        "/chat",
+        json={"message": "hi", "store_id": "main-street-market", "allowed_tools": ["search_knowledge_base"]},
     )
     assert response.status_code == 200
     assert seen["allowed_tools"] == ["search_knowledge_base"]
+    assert seen["store_id"] == "main-street-market"
 
 
 def test_chat_endpoint_rejects_unknown_tool_in_allowlist(client: TestClient) -> None:
-    response = client.post("/chat", json={"message": "hi", "allowed_tools": ["delete_everything"]})
+    response = client.post(
+        "/chat",
+        json={"message": "hi", "store_id": "main-street-market", "allowed_tools": ["delete_everything"]},
+    )
     assert response.status_code == 422
     assert "delete_everything" in response.json()["detail"]
+
+
+def test_chat_endpoint_requires_a_store(client: TestClient) -> None:
+    response = client.post("/chat", json={"message": "hi"})
+    assert response.status_code == 422
+
+
+def test_chat_endpoint_rejects_unknown_store(client: TestClient) -> None:
+    response = client.post("/chat", json={"message": "hi", "store_id": "some-other-store"})
+    assert response.status_code == 422
+    assert "some-other-store" in response.json()["detail"]

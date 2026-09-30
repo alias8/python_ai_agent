@@ -25,7 +25,7 @@ from sqlalchemy import func, select
 from ..shared.db import new_session
 from ..shared.tools_core import SearchKnowledgeBaseInput
 from .chunking import Chunk, chunk_article
-from .kb_corpus import load_articles
+from .kb_corpus import load_articles, store_ids
 from .kb_models import KBChunkRow
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
@@ -160,6 +160,7 @@ def _keyword_query(query: str) -> Any:
 def _to_scored(row: KBChunkRow, distance: float, keyword_match: bool) -> ScoredChunk:
     chunk = Chunk(
         id=row.id,
+        store_id=row.store_id,
         article_id=row.article_id,
         article_title=row.article_title,
         heading=row.heading,
@@ -168,10 +169,16 @@ def _to_scored(row: KBChunkRow, distance: float, keyword_match: bool) -> ScoredC
     return ScoredChunk(chunk=chunk, similarity=1 - distance, keyword_match=keyword_match)
 
 
-def search_chunks(query: str, k: int) -> list[ScoredChunk]:
-    """Top-k chunks, best first: vector search and keyword search fused with
-    reciprocal rank fusion. No relevance cutoff is applied — that's
-    is_relevant()'s job — so evals/kb_eval.py can score the raw ranking."""
+def search_chunks(query: str, k: int, store_id: str) -> list[ScoredChunk]:
+    """Top-k of one store's chunks, best first: vector search and keyword
+    search fused with reciprocal rank fusion. No relevance cutoff is applied
+    — that's is_relevant()'s job — so evals/kb_eval.py can score the raw
+    ranking.
+
+    store_id must come from the server (the agent's run context), never
+    from anything the model supplies — see langchain/agent.py."""
+    if store_id not in store_ids():
+        raise ValueError(f"unknown store: {store_id!r}")
     _check_index_ready()
     query_vector = _get_model().encode(query).tolist()
     distance = KBChunkRow.embedding.cosine_distance(query_vector)
@@ -183,14 +190,23 @@ def search_chunks(query: str, k: int) -> list[ScoredChunk]:
         # set_config(..., true) is SET LOCAL: it lasts only for this
         # transaction, so it never leaks to other users of the pooled connection.
         session.execute(select(func.set_config("hnsw.ef_search", str(ef_search), True)))
+        # Filtering an HNSW search is a trap: the index finds the ef_search
+        # nearest vectors across ALL stores, and the WHERE clause filters
+        # them afterwards. For a store with a small share of the rows, most
+        # of those candidates belong to other stores, so a search can come
+        # back with fewer than k results, or none. pgvector 0.8's iterative
+        # scan keeps searching the index until enough rows pass the filter
+        # (strict_order keeps results in exact distance order).
+        session.execute(select(func.set_config("hnsw.iterative_scan", "strict_order", True)))
+        in_store = KBChunkRow.store_id == store_id
         vector_rows = session.execute(
-            select(KBChunkRow, distance).order_by(distance).limit(candidates)
+            select(KBChunkRow, distance).where(in_store).order_by(distance).limit(candidates)
         ).all()
         keyword_ids = session.scalars(
             select(KBChunkRow.id)
             # numnode = 0 means the query was all stopwords ("how do I"):
             # nothing to match, and Postgres would warn on every row.
-            .where(func.numnode(tsquery) > 0, KBChunkRow.search_vector.op("@@")(tsquery))
+            .where(in_store, func.numnode(tsquery) > 0, KBChunkRow.search_vector.op("@@")(tsquery))
             .order_by(func.ts_rank_cd(KBChunkRow.search_vector, tsquery).desc())
             .limit(candidates)
         ).all()
@@ -200,7 +216,7 @@ def search_chunks(query: str, k: int) -> list[ScoredChunk]:
         missing = [chunk_id for chunk_id in keyword_ids if chunk_id not in rows]
         if missing:
             for row, dist in session.execute(
-                select(KBChunkRow, distance).where(KBChunkRow.id.in_(missing))
+                select(KBChunkRow, distance).where(in_store, KBChunkRow.id.in_(missing))
             ):
                 rows[row.id] = (row, dist)
 
@@ -213,8 +229,10 @@ def search_chunks(query: str, k: int) -> list[ScoredChunk]:
     return [_to_scored(*rows[chunk_id], keyword_match=chunk_id in keyword_set) for chunk_id in ranked]
 
 
-def search_knowledge_base_semantic(input: SearchKnowledgeBaseInput) -> str:
-    matches = [scored for scored in search_chunks(input.query, k=_TOP_K) if is_relevant(scored)]
+def search_knowledge_base_semantic(input: SearchKnowledgeBaseInput, store_id: str) -> str:
+    matches = [
+        scored for scored in search_chunks(input.query, k=_TOP_K, store_id=store_id) if is_relevant(scored)
+    ]
     if not matches:
         return f'No knowledge base articles matched "{input.query}"'
     return "\n\n---\n\n".join(f"# {m.chunk.context}\n\n{m.chunk.text}" for m in matches)

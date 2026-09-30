@@ -19,6 +19,8 @@ class KBChunkRow(Base):
     __tablename__ = "kb_chunks"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)  # "<article id>#<n>"
+    # The tenant. Every search filters on it — see knowledge_base.search_chunks.
+    store_id: Mapped[str] = mapped_column(String, index=True)
     article_id: Mapped[str] = mapped_column(String, index=True)
     article_title: Mapped[str] = mapped_column(Text)
     heading: Mapped[str] = mapped_column(Text)

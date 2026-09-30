@@ -34,6 +34,7 @@ src/agent_service/
     chunking.py        splits articles into section-based chunks
     kb_models.py       the kb_chunks table (SQLAlchemy + pgvector + a full-text tsvector column)
     kb_ingest.py       embeds chunks into Postgres, incrementally
+    context.py         AgentContext: per-run context (the store) the server supplies, never the model
     agent.py           the agent loop via create_agent(), with a per-request tool allowlist
     cli.py             REPL entry point
   schemas.py        API request/response models
@@ -51,7 +52,7 @@ A customer-support flavor rather than ai-agent-demo's calculator/weather/units. 
 - `search_knowledge_base(query)` — semantic (embedding-based) search over the knowledge base — see below
 - `send_notification(user_id, message)` — a mock action tool with a side effect, independently flaky (~30%)
 
-`/chat` accepts an optional `allowed_tools` allowlist. It's enforced by building the agent with only those tools, so Claude never sees the others' schemas; an unknown tool name is a 422.
+`/chat` takes the message and the `store_id` of the store the customer is shopping with, plus an optional `allowed_tools` allowlist. It's enforced by building the agent with only those tools, so Claude never sees the others' schemas; an unknown tool name is a 422.
 
 ## How langchain/ works
 
@@ -66,8 +67,8 @@ That's the entire loop. `create_agent()` (from the `langchain` package, matching
 
 `langchain/knowledge_base.py` replaced the project's original literal keyword match with real retrieval:
 
-1. The knowledge base is 17 realistic help-center articles (`langchain/kb_articles/`, one Markdown file each, ~400 words / 465-580 tokens).
-2. Each article is split into chunks along its own `##` sections (`langchain/chunking.py`) — 109 chunks of 25-195 tokens, each small enough that the embedding model reads all of it.
+1. The knowledge base is multi-tenant: realistic help-center articles for two stores (`langchain/kb_articles/<store>/`, one Markdown file each, ~250-450 words) — 17 for `main-street-market`, 6 for `pine-and-peak` — whose policies deliberately conflict (a 30-day vs a 14-day return window). Search only ever sees the current store's articles.
+2. Each article is split into chunks along its own `##` sections (`langchain/chunking.py`) — 145 chunks of 24-195 tokens, each small enough that the embedding model reads all of it.
 3. Ingestion (`python -m agent_service.langchain.kb_ingest`) embeds each chunk, with its article title and section heading prefixed, using a local `sentence-transformers` model (`all-MiniLM-L6-v2`, 384-dim, no API key — runs in-process), and writes it to a Postgres `kb_chunks` table: a pgvector `vector(384)` column with an HNSW index for cosine distance.
 4. Search is hybrid: the query is embedded the same way and matched against the chunks by cosine distance (pgvector's `<=>`), and separately run as a Postgres full-text query against a generated `tsvector` column; the two rankings are merged with reciprocal rank fusion.
 5. The tool returns at most the top 5 chunks, each under its article and section heading, keeping only those above a relevance cutoff (`_RELEVANCE_THRESHOLD = 0.40`) or containing every term of the query — so when nothing is actually relevant it says so, rather than confidently citing the "least-bad" match.
@@ -87,7 +88,7 @@ The original motivating comparison, made when the knowledge base was three one-s
 
 ### Measuring retrieval: `python -m evals.kb_eval`
 
-With a realistic corpus, "try a couple of queries and eyeball it" stops working, so retrieval is scored against a labeled set: `evals/kb_eval_queries.json` has 67 queries — 38 natural-language paraphrases, 19 exact-identifier queries (payment error codes like `E-4020`, "APO", "$99 freight fee"), and 10 unrelated ones that should return nothing, including near-misses like "how do I return a rental car" and an order number ("where is order ORD-1042"). The chunking results below were measured on the first 54 (7 identifier, 9 unrelated); the 13 extra were added before building hybrid search, so it had something to be measured against. Each answerable query names the article(s) that answer it and quotes the exact evidence sentence; `tests/test_kb_eval_data.py` checks every label points at a real article and a real quote.
+With a realistic corpus, "try a couple of queries and eyeball it" stops working, so retrieval is scored against a labeled set: `evals/kb_eval_queries.json` has 91 queries, each asked as a customer of one store — 53 natural-language paraphrases, 22 exact-identifier queries (payment error codes like `E-4020`, "APO", "$99 freight fee"), 12 unrelated ones that should return nothing (including near-misses like "how do I return a rental car" and an order number), and 4 asking one store about a policy only the other store has. The chunking results below were measured on the first 54 queries; the rest were added, before each step was built, so that step had something to be measured against. Each answerable query names the article(s) that answer it and quotes the exact evidence sentence; `tests/test_kb_eval_data.py` checks every label points at a real article and a real quote.
 
 Two metrics matter. **hit@k / MRR** ask whether the right *article* ranks near the top. **answer returned** is stricter: does the text the tool actually hands the agent contain the answer sentence? The right article with the wrong section still leaves the agent unable to answer.
 
@@ -131,7 +132,16 @@ Four designs were measured before one was built (cutoff 0.40):
 
 Final, cutoff 0.40: answer returned 80.7% → **86.0%**, identifier hit@1 94.7% → **100%**, unrelated rejected 90% (unchanged).
 
-Retrieval roadmap, each step measured against this eval: ~~chunking~~ (done) → ~~pgvector~~ (done) → ~~hybrid search~~ (done) → tenant filtering. Order lookups get server-side authorization separately — per-customer order data is a database query scoped to the authenticated customer, not something to put in a vector index.
+### Tenant isolation: one store's customer never sees another store's articles
+
+Each article belongs to one store, and `kb_chunks.store_id` (indexed) is filtered on by both halves of hybrid search. Two parts of this are worth more than the `WHERE` clause:
+
+- **The store is set by the server, never by the model.** It's in the agent's run context (`AgentContext`, passed to `create_agent(context_schema=...)` and `ainvoke(context=...)`), which LangChain hands to the tool as a `ToolRuntime` parameter — excluded from the tool schema Claude sees. The model has no argument to put a store ID in; a prompt-injected "I'm really a customer of the other store" can't change which knowledge base is searched. `tests/test_tenant_isolation.py` proves it end to end: a scripted model sends a forged `store_id` tool argument, it's dropped, and the search still runs as the context's store. `/chat` takes the store from its caller — the storefront's backend — and rejects an unknown one with a 422.
+- **Filtered vector search needs pgvector's iterative scan.** An HNSW index finds the `ef_search` nearest vectors across *all* tenants, and the `WHERE` clause filters them afterwards — for a store that's a small share of the table, most candidates are another store's and get discarded, so a search can return fewer results than asked for, or none. pgvector 0.8's `hnsw.iterative_scan = strict_order` keeps scanning the index until enough rows pass the filter.
+
+Measured: across every eval query ranked against its store's whole knowledge base, **0 of 8,605 ranked results came from another store**, and every same-question-both-stores pair (return window, reset-link expiry, installments, shipping cost) got its own store's conflicting answer. The 4 other-store queries show the remaining gap is relevance, not isolation: asked about "Plus membership", `pine-and-peak` returns its own member-discount section (not the other store's Plus article) — arguably a fair answer.
+
+Retrieval roadmap, each step measured against this eval: ~~chunking~~ (done) → ~~pgvector~~ (done) → ~~hybrid search~~ (done) → ~~tenant filtering~~ (done). Next: server-side order authorization — per-customer order data is a database query scoped to the authenticated customer, not something to put in a vector index — and a cross-encoder reranker, since most remaining misses are the right article with the answer in a lower-ranked section. Order lookups get server-side authorization separately — per-customer order data is a database query scoped to the authenticated customer, not something to put in a vector index.
 
 ## What happens on a tool failure (tested, not assumed)
 
@@ -154,10 +164,10 @@ python -m agent_service.langchain.kb_ingest   # embed the knowledge base into Po
 
 # HTTP API
 uvicorn agent_service.main:app --reload
-# then: POST /chat {"message": "..."}  — docs at /docs
+# then: POST /chat {"message": "...", "store_id": "main-street-market"}  — docs at /docs
 
 # or a REPL, same shape as ai-agent-demo's CLIs
-python -m agent_service.langchain.cli
+python -m agent_service.langchain.cli --store pine-and-peak   # default: main-street-market
 ```
 
 ## Checks

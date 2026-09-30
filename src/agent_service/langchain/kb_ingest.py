@@ -59,6 +59,7 @@ def ingest(
         rows = [
             {
                 "id": chunk.id,
+                "store_id": chunk.store_id,
                 "article_id": chunk.article_id,
                 "article_title": chunk.article_title,
                 "heading": chunk.heading,
