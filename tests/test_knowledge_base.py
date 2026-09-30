@@ -1,4 +1,4 @@
-"""Exercises the real embedding model + ChromaDB collection, not a mock —
+"""Exercises the real embedding model + a real Postgres (pgvector), not mocks —
 the whole point of this module is retrieval quality (does it actually find
 a paraphrase with no shared keywords, does it actually reject an unrelated
 query), which a mocked encoder couldn't demonstrate. First run downloads
@@ -8,6 +8,9 @@ everything after model load is local, no ANTHROPIC_API_KEY needed.
 These are smoke tests for the tool's behavior; retrieval quality across the
 whole labeled query set is measured by evals/kb_eval.py, not asserted here."""
 
+import pytest
+
+from agent_service.langchain import knowledge_base
 from agent_service.langchain.knowledge_base import (
     _TOP_K,
     count_tokens,
@@ -15,6 +18,8 @@ from agent_service.langchain.knowledge_base import (
     search_knowledge_base_semantic,
 )
 from agent_service.shared.tools_core import SearchKnowledgeBaseInput
+
+pytestmark = pytest.mark.usefixtures("kb_database")
 
 
 def test_finds_paraphrase_with_no_shared_keywords() -> None:
@@ -59,3 +64,15 @@ def test_no_chunk_is_truncated_by_the_model_window() -> None:
     # edit producing a paragraph too long to chunk under the limit.
     for chunk in get_chunks():
         assert count_tokens(chunk.embedding_text) <= 254, chunk.id
+
+
+def test_search_refuses_vectors_from_a_different_embedding_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    # As if the model had been swapped without re-running ingestion: the
+    # stored vectors are no longer comparable to the query's.
+    monkeypatch.setattr(knowledge_base, "EMBEDDING_MODEL_NAME", "some-other-model")
+    knowledge_base._check_index_ready.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="embedded by a model other than some-other-model"):
+            search_knowledge_base_semantic(SearchKnowledgeBaseInput(query="refund"))
+    finally:
+        knowledge_base._check_index_ready.cache_clear()

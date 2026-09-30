@@ -8,6 +8,22 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      # The same pgvector image docker-compose.yml runs locally, on the same
+      # port, so tests/conftest.py's default test database URL just works.
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: agent
+          POSTGRES_PASSWORD: agent
+          POSTGRES_DB: agent_service_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U agent -d agent_service_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

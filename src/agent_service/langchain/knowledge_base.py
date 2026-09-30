@@ -3,29 +3,31 @@
 Embedding-based retrieval, replacing the project's original literal
 substring/keyword match: article chunks (see chunking.py) and the query are
 both embedded with a local sentence-transformers model, and matches are
-found by vector similarity in a ChromaDB collection, not literal word
+found by vector similarity in Postgres (pgvector), not literal word
 overlap — so "how do I send something back" finds the returns article with
 no words in common with it. Retrieval quality is measured by
 evals/kb_eval.py.
 
-Runs fully locally: sentence-transformers downloads its model (~90MB, once,
-cached under ~/.cache/huggingface) the first time it's used; both the
-embedding model and ChromaDB run in-process after that — no new API key, no
-network call once the model is cached.
+Chunks are embedded ahead of time by kb_ingest.py and stored in the
+kb_chunks table; a search only embeds the query. The embedding model runs
+locally: sentence-transformers downloads it (~90MB, once, cached under
+~/.cache/huggingface) the first time it's used — no API key, no network
+call once it's cached.
 """
 
 from dataclasses import dataclass
 from functools import lru_cache
 
-import chromadb
-from chromadb.api.models.Collection import Collection
 from sentence_transformers import SentenceTransformer
+from sqlalchemy import func, select
 
+from ..shared.db import new_session
 from ..shared.tools_core import SearchKnowledgeBaseInput
 from .chunking import Chunk, chunk_article
 from .kb_corpus import load_articles
+from .kb_models import KBChunkRow
 
-_EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 # Upper bound on a chunk's own text. The model's window is 256 tokens
 # including 2 special tokens, and the title/heading prefix adds up to ~20
@@ -57,14 +59,14 @@ _TOP_K = 5
 @dataclass(frozen=True)
 class ScoredChunk:
     chunk: Chunk
-    similarity: float  # cosine similarity, 1 - Chroma's cosine distance
+    similarity: float  # cosine similarity: 1 - pgvector's cosine distance (<=>)
 
 
 @lru_cache
 def _get_model() -> SentenceTransformer:
     # Loading the model is the expensive part (a few seconds) — cached so
     # it happens once per process, not once per search.
-    return SentenceTransformer(_EMBEDDING_MODEL_NAME)
+    return SentenceTransformer(EMBEDDING_MODEL_NAME)
 
 
 def count_tokens(text: str) -> int:
@@ -81,44 +83,75 @@ def get_chunks() -> tuple[Chunk, ...]:
     )
 
 
-@lru_cache
-def _chunks_by_id() -> dict[str, Chunk]:
-    return {chunk.id: chunk for chunk in get_chunks()}
-
-
 # Turns chunk text into vectors that will be used for searching/comparing to the user question
-@lru_cache
-def _get_collection() -> Collection:
+def embed_texts(texts: list[str]) -> list[list[float]]:
     # it reads the ~90MB of weights from ~/.cache/huggingface into memory.
     # The result is a PyTorch neural net that turns text into a list of 384 floats from -1 to +1
     model = _get_model()
-    client = chromadb.EphemeralClient() # creates an in-memory Chroma database
-    # collection is roughly a table
-    collection = client.get_or_create_collection("kb_chunks", metadata={"hnsw:space": "cosine"})
-    chunks = get_chunks()
-    ids = [chunk.id for chunk in chunks]
-    bodies = [chunk.embedding_text for chunk in chunks]
     # one row per chunk. Chunk turned into vector of length 384.
-    # Unused — kept only to inspect in the debugger when stepping through.
-    bodies_encoded = model.encode(bodies).tolist()  # noqa: F841
-    collection.add(ids=ids, documents=bodies, embeddings=model.encode(bodies).tolist())
-    return collection
+    bodies_encoded: list[list[float]] = model.encode(texts).tolist()
+    return bodies_encoded
+
+
+@lru_cache
+def _check_index_ready() -> None:
+    # Fails loudly instead of letting search quietly return "no matches":
+    # an empty table (ingestion never run) or vectors from a different
+    # embedding model (model changed, not re-ingested) would both look like
+    # "nothing relevant" to the agent. Cached on success only — lru_cache
+    # doesn't cache an exception, so a fixed database is picked up next call.
+    with new_session() as session:
+        total = session.scalar(select(func.count()).select_from(KBChunkRow)) or 0
+        other_model = session.scalar(
+            select(func.count()).where(KBChunkRow.embedding_model != EMBEDDING_MODEL_NAME)
+        ) or 0
+    fix = "run `python -m agent_service.langchain.kb_ingest`"
+    if total == 0:
+        raise RuntimeError(f"knowledge base is empty — {fix}")
+    if other_model:
+        raise RuntimeError(
+            f"{other_model} knowledge base chunks were embedded by a model other than "
+            f"{EMBEDDING_MODEL_NAME}, so they can't be compared to query vectors — {fix}"
+        )
+
+
+# HNSW's search-time candidate list size (pgvector's default is 40). An HNSW
+# index scan returns at most this many rows, however high the LIMIT — so the
+# eval, which ranks every chunk, would silently get only 40 back. Raised to k
+# when a caller asks for more; pgvector's max is 1000. (At today's 109 rows
+# the planner skips the index for a cheaper full scan + sort, so the cap
+# doesn't bite yet — verified by forcing the index: 40 rows at the default,
+# 109 with ef_search raised. It would once the table grows.)
+_MIN_EF_SEARCH = 40
+_MAX_EF_SEARCH = 1000
 
 
 def search_chunks(query: str, k: int) -> list[ScoredChunk]:
     """Top-k chunks by similarity, best first, with no relevance cutoff
     applied — the raw ranking, which evals/kb_eval.py scores directly."""
-    collection = _get_collection() # built once at first call
-    query_embedding = _get_model().encode([query]).tolist()
-    result = collection.query(query_embeddings=query_embedding, n_results=k)
+    _check_index_ready()
+    query_vector = _get_model().encode(query).tolist()
+    distance = KBChunkRow.embedding.cosine_distance(query_vector)
+    ef_search = min(max(k, _MIN_EF_SEARCH), _MAX_EF_SEARCH)
 
-    ids = result["ids"][0]
-    distances = result["distances"][0] if result["distances"] is not None else []
-    by_id = _chunks_by_id()
-    return [
-        ScoredChunk(chunk=by_id[chunk_id], similarity=1 - distance)
-        for chunk_id, distance in zip(ids, distances, strict=True)
-    ]
+    with new_session() as session:
+        # set_config(..., true) is SET LOCAL: it lasts only for this
+        # transaction, so it never leaks to other users of the pooled connection.
+        session.execute(select(func.set_config("hnsw.ef_search", str(ef_search), True)))
+        rows = session.execute(select(KBChunkRow, distance.label("distance")).order_by(distance).limit(k))
+        return [
+            ScoredChunk(
+                chunk=Chunk(
+                    id=row.id,
+                    article_id=row.article_id,
+                    article_title=row.article_title,
+                    heading=row.heading,
+                    text=row.text,
+                ),
+                similarity=1 - dist,
+            )
+            for row, dist in rows
+        ]
 
 
 def search_knowledge_base_semantic(input: SearchKnowledgeBaseInput) -> str:

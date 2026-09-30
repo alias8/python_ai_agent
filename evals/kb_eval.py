@@ -1,6 +1,6 @@
 """Retrieval eval for langchain/knowledge_base.py's semantic search.
 
-Scores the real embedding model + ChromaDB collection against the labeled
+Scores the real embedding model + Postgres (pgvector) index against the labeled
 queries in kb_eval_queries.json, so a change to retrieval (chunking, a new
 embedding model, hybrid search, a different threshold) is judged by numbers
 rather than by eyeballing a couple of queries.

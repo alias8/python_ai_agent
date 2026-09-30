@@ -10,16 +10,19 @@ dependencies = [
     "pydantic-settings>=2.6",
     "langchain>=1.4",
     "langchain-anthropic>=1.7",
-    # langchain/knowledge_base.py's semantic search — local embeddings (sentence-transformers)
-    # + an embedded vector store (chromadb).
+    # Postgres + pgvector: the knowledge base's vector store (and, from milestone 2, app state).
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.2",
+    "pgvector>=0.3",
+    "alembic>=1.13",
+    # langchain/knowledge_base.py's semantic search — local embeddings (sentence-transformers).
     #
     # Pinned versions below are load-bearing, not arbitrary: on an Intel Mac, PyPI only ships torch
     # up to 2.2.2 (Apple dropped x86_64 macOS wheels after that), and sentence-transformers>=4 requires
     # torch>=2.5 — so >=4 silently fails to import at runtime rather than failing to install. numpy<2 /
     # scipy<1.13 / scikit-learn<1.5 are pinned down the same chain: torch==2.2.2's C extensions were
-    # built against NumPy 1.x's ABI, and a bare numpy>=2 install (chromadb's own transitive pull) crashes
+    # built against NumPy 1.x's ABI, and a bare numpy>=2 install (e.g. a transitive pull) crashes
     # it. This combination is verified working; loosen it only after testing on the target machine.
-    "chromadb>=1.5",
     "sentence-transformers>=3.4,<4",
     "numpy<2",
     "scipy<1.13",
@@ -48,7 +51,7 @@ where = ["src"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["src", "tests", "evals"]
+files = ["src", "tests", "evals", "migrations"]
 plugins = ["pydantic.mypy"]
 
 [tool.ruff]

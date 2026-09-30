@@ -15,6 +15,8 @@ class Settings(BaseSettings):
 
     anthropic_api_key: str
     claude_model: str = "claude-sonnet-5"
+    # Matches docker-compose.yml's local Postgres (port 5433, not 5432).
+    database_url: str = "postgresql+psycopg://agent:agent@localhost:5433/agent_service"
 
 
 @lru_cache

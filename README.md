@@ -23,17 +23,22 @@ Python's type hints aren't enforced at runtime the way Kotlin's are — `mypy` c
 src/agent_service/
   shared/
     config.py       Settings via pydantic-settings — fails fast on a missing ANTHROPIC_API_KEY
+    db.py           SQLAlchemy engine + session factory
     exceptions.py   TransientToolError
     tools_core.py   Pydantic-modeled tool inputs + order/notification business logic
     trace.py        JSONL tracing, ported from ai-agent-demo's shared/trace.ts
   langchain/
     tools.py           wraps the tools as LangChain @tool objects, with JSONL tracing
-    knowledge_base.py  semantic search (local embeddings + ChromaDB)
+    knowledge_base.py  semantic search (local embeddings + pgvector)
     kb_corpus.py       loads kb_articles/ (17 Markdown help-center articles)
+    chunking.py        splits articles into section-based chunks
+    kb_models.py       the kb_chunks table (SQLAlchemy + pgvector)
+    kb_ingest.py       embeds chunks into Postgres, incrementally
     agent.py           the agent loop via create_agent(), with a per-request tool allowlist
     cli.py             REPL entry point
   schemas.py        API request/response models
   main.py           FastAPI app (/health, /chat)
+migrations/         Alembic schema migrations
 evals/              retrieval eval: labeled queries + `python -m evals.kb_eval`
 tests/              pytest + pytest-asyncio
 ```
@@ -63,9 +68,20 @@ That's the entire loop. `create_agent()` (from the `langchain` package, matching
 
 1. The knowledge base is 17 realistic help-center articles (`langchain/kb_articles/`, one Markdown file each, ~400 words / 465-580 tokens).
 2. Each article is split into chunks along its own `##` sections (`langchain/chunking.py`) — 109 chunks of 25-195 tokens, each small enough that the embedding model reads all of it.
-3. Each chunk is embedded, with its article title and section heading prefixed, by a local `sentence-transformers` model (`all-MiniLM-L6-v2`, 384-dim, no API key — runs in-process) and stored in an in-memory ChromaDB collection.
-4. A query is embedded the same way and matched against the chunks by cosine similarity, not word overlap.
+3. Ingestion (`python -m agent_service.langchain.kb_ingest`) embeds each chunk, with its article title and section heading prefixed, using a local `sentence-transformers` model (`all-MiniLM-L6-v2`, 384-dim, no API key — runs in-process), and writes it to a Postgres `kb_chunks` table: a pgvector `vector(384)` column with an HNSW index for cosine distance.
+4. A query is embedded the same way and matched against the chunks in SQL by cosine distance (pgvector's `<=>`), not word overlap.
 5. The tool returns at most the top 5 chunks, each under its article and section heading, and only those above a relevance cutoff (`_RELEVANCE_THRESHOLD = 0.40`) — so when nothing is actually relevant it says so, rather than confidently citing the "least-bad" match.
+
+### Postgres + pgvector, not an in-process vector store
+
+The chunks started out in an in-memory ChromaDB collection, rebuilt (and every chunk re-embedded) on every process start. They now live in Postgres, which is what milestone 2 needed anyway, so vectors sit in the same database as the rest of the app's data rather than in a second system to run:
+
+- **Schema via Alembic** (`migrations/versions/0001_create_kb_chunks.py`), including `CREATE EXTENSION vector` — which `alembic revision --autogenerate` doesn't emit, so the migration is hand-written; `alembic check` confirms it matches the SQLAlchemy model.
+- **Ingestion is incremental, and separate from search.** Each row stores a sha256 of what was embedded (model name + chunk text): re-running ingestion re-embeds only edited chunks, deletes chunks that no longer exist, and re-embeds everything if the model changes. Search only ever embeds the query.
+- **Every row records its embedding model**, and search refuses to run (a loud error, not "no matches") if the table is empty or holds vectors from a different model than the one embedding the query — vectors from two models aren't comparable, and silently comparing them returns garbage that looks plausible.
+- **An HNSW gotcha, verified:** an HNSW index scan returns at most `hnsw.ef_search` rows (default 40) whatever the `LIMIT`. The eval ranks every chunk, so search raises `ef_search` per transaction (`set_config(..., true)`, i.e. `SET LOCAL`, so it can't leak to other users of a pooled connection). At 109 rows the planner actually skips the index for a full scan, so it doesn't bite yet — forcing the index returns 40 rows at the default and all 109 with it raised.
+
+Moving from Chroma to pgvector left every eval number unchanged — the check that the migration changed storage, not retrieval.
 
 The original motivating comparison, made when the knowledge base was three one-sentence articles: querying **"how do I send something back"** (zero words in common with the article that answers it), the keyword version returned **all three** articles — splitting the query into words includes the single-letter term `"i"`, which substring-matched every article — while semantic search returned just the return policy.
 
@@ -94,7 +110,7 @@ What it showed, in order:
 - **The cutoff had to be re-tuned, twice.** 0.35 was tuned on the original one-sentence articles; on whole long articles it dropped a third of answerable queries, because a 500-token vector is diluted and scores lower against everything. After chunking the sweep favoured 0.40: 0.45 rejects all 9 unrelated queries but drops answer recall to 69%, and the agent can ignore a loosely related chunk but can't answer from one it never received. A threshold belongs to a model *and* a corpus *and* a chunking scheme. It's also tuned on the same 54 queries it's measured on, so the numbers are optimistic until the set is big enough for a held-out split.
 - **Chunking isn't free.** "how do I send something back" regressed: short chunks like "Returned to sender" and "send the original item back" (exchanges) now out-rank the returns article's "How to start a return", which lands 6th. Other remaining misses are the same shape — the right article, but the answer in a lower-scoring section ("the vase arrived smashed" ranks "What happens to the damaged item" above "Report the problem within 7 days"). A cross-encoder reranker over the top ~20 chunks is the usual fix.
 
-Retrieval roadmap, each step measured against this eval: ~~chunking~~ (done) → pgvector (with milestone 2's Postgres) → hybrid search via Postgres full-text + vector ranking → tenant filtering. Order lookups get server-side authorization separately — per-customer order data is a database query scoped to the authenticated customer, not something to put in a vector index.
+Retrieval roadmap, each step measured against this eval: ~~chunking~~ (done) → ~~pgvector~~ (done) → hybrid search via Postgres full-text + vector ranking → tenant filtering. Order lookups get server-side authorization separately — per-customer order data is a database query scoped to the authenticated customer, not something to put in a vector index.
 
 ## What happens on a tool failure (tested, not assumed)
 
@@ -110,6 +126,10 @@ The TypeScript and Python LangChain ecosystems don't even agree with each other 
 python3.12 -m venv .venv && source .venv/bin/activate   # must be 3.12, see the pins in pyproject.toml
 pip install -e ".[dev]"
 cp .env.example .env   # add your ANTHROPIC_API_KEY
+
+docker compose up -d                          # Postgres 16 + pgvector on port 5433 (plus a test database)
+alembic upgrade head                          # create the schema
+python -m agent_service.langchain.kb_ingest   # embed the knowledge base into Postgres (re-run after editing articles)
 
 # HTTP API
 uvicorn agent_service.main:app --reload
@@ -128,7 +148,7 @@ pytest -q         # unit + integration tests
 python -m evals.kb_eval  # retrieval quality report (not run in CI — it reports numbers, it doesn't pass/fail)
 ```
 
-All three run in CI on every push/PR (`.github/workflows/ci.yml`), which caches both pip packages and the downloaded embedding model (`actions/cache` on `~/.cache/huggingface`) to keep runs fast after the first. No `ANTHROPIC_API_KEY` or paid API call is needed for any of it — no test calls Claude — but `tests/test_knowledge_base.py` does load a real `sentence-transformers` model and run it against a real ChromaDB collection (network needed once, to populate a cold Hugging Face cache; local after that), because retrieval *quality* — does it actually find a keyword-free paraphrase, does it actually reject an irrelevant query — is the entire point of that module and can't be demonstrated with a mock.
+All three run in CI on every push/PR (`.github/workflows/ci.yml`), which caches both pip packages and the downloaded embedding model (`actions/cache` on `~/.cache/huggingface`) to keep runs fast after the first. No `ANTHROPIC_API_KEY` or paid API call is needed for any of it — no test calls Claude — but the tests do need the Postgres container running (`docker compose up -d`; CI runs the same image as a service container) — they migrate and use a separate `agent_service_test` database, never dev data — and `tests/test_knowledge_base.py` loads a real `sentence-transformers` model and runs it against real pgvector search (network needed once, to populate a cold Hugging Face cache; local after that), because retrieval *quality* — does it actually find a keyword-free paraphrase, does it actually reject an irrelevant query — is the entire point of that module and can't be demonstrated with a mock.
 
 There's no automated test for a full `create_agent()` run (mocking LangGraph's internals deep enough to be worth it wasn't — the tool-failure finding above was verified with a one-off scripted fake model instead, not committed as a test); the tool allowlist, `/chat`, and `langchain/knowledge_base.py`'s retrieval are unit-tested like everything else.
 
