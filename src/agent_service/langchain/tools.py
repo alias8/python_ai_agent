@@ -1,10 +1,8 @@
 """Wraps shared/tools_core.py's business logic as LangChain tools.
 
-Unlike direct_api/tools.py, there's no schema to hand-build here either:
-@tool(..., args_schema=Model) takes the same Pydantic model directly, so
-Claude's JSON Schema (direct_api) and LangChain's tool schema (this file)
-are generated from the exact same source, not two schemas kept in sync by
-hand.
+There's no schema to hand-build here: @tool(..., args_schema=Model) takes
+the tool's Pydantic input model directly, so the JSON Schema Claude sees is
+generated from the same model that validates the input.
 """
 
 import time
@@ -22,11 +20,10 @@ from ..shared.tools_core import (
 from ..shared.trace import trace_tool_call
 from .knowledge_base import search_knowledge_base_semantic
 
-# A per-process call sequence number, standing in for direct_api's loop
-# iteration index. create_agent()'s underlying LangGraph run doesn't expose
-# "which loop iteration is this" the way our hand-rolled loop does, so this
-# instead just numbers tool calls in the order they run within a single
-# run_agent() call — comparable for tracing purposes, not identical.
+# A per-process call sequence number for the trace's "iteration" field.
+# create_agent()'s underlying LangGraph run doesn't expose "which loop
+# iteration is this", so this instead numbers tool calls in the order they
+# run within a single run_agent() call.
 _call_sequence = 0
 
 
@@ -36,13 +33,11 @@ def reset_call_sequence() -> None:
 
 
 def _traced(name: str, model: type[Any], func: Any) -> Any:
-    # Wraps a tools_core function with the same trace_tool_call entry
-    # direct_api's agent loop writes, so the two are comparable side by
-    # side. Unlike direct_api, this does NOT retry or catch TransientToolError
-    # itself — it logs and re-raises, so LangGraph's own tool-error handling
-    # is what actually determines what happens next. That's the point of
-    # comparison: this only adds observability, LangChain's runtime supplies
-    # whatever resilience you get without writing anything else.
+    # Wraps a tools_core function with a JSONL trace_tool_call entry. This
+    # does NOT retry or catch TransientToolError itself — it logs and
+    # re-raises, so LangGraph's own tool-error handling is what actually
+    # determines what happens next (see the README: by default, it crashes
+    # the run).
     def adapter(**kwargs: Any) -> str:
         global _call_sequence
         iteration = _call_sequence

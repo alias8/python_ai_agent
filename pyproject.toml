@@ -6,40 +6,33 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
-    "anthropic>=0.40",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
-    "tenacity>=9.0",
-]
-
-[project.optional-dependencies]
-langchain = [
     "langchain>=1.4",
     "langchain-anthropic>=1.7",
-]
-# langchain/knowledge_base.py's semantic search — local embeddings (sentence-transformers)
-# + an embedded vector store (chromadb), LangChain-only (direct_api keeps the keyword version).
-#
-# Pinned versions below are load-bearing, not arbitrary: on an Intel Mac, PyPI only ships torch
-# up to 2.2.2 (Apple dropped x86_64 macOS wheels after that), and sentence-transformers>=4 requires
-# torch>=2.5 — so >=4 silently fails to import at runtime rather than failing to install. numpy<2 /
-# scipy<1.13 / scikit-learn<1.5 are pinned down the same chain: torch==2.2.2's C extensions were
-# built against NumPy 1.x's ABI, and a bare numpy>=2 install (chromadb's own transitive pull) crashes
-# it. This combination is verified working; loosen it only after testing on the target machine.
-rag = [
+    # langchain/knowledge_base.py's semantic search — local embeddings (sentence-transformers)
+    # + an embedded vector store (chromadb).
+    #
+    # Pinned versions below are load-bearing, not arbitrary: on an Intel Mac, PyPI only ships torch
+    # up to 2.2.2 (Apple dropped x86_64 macOS wheels after that), and sentence-transformers>=4 requires
+    # torch>=2.5 — so >=4 silently fails to import at runtime rather than failing to install. numpy<2 /
+    # scipy<1.13 / scikit-learn<1.5 are pinned down the same chain: torch==2.2.2's C extensions were
+    # built against NumPy 1.x's ABI, and a bare numpy>=2 install (chromadb's own transitive pull) crashes
+    # it. This combination is verified working; loosen it only after testing on the target machine.
     "chromadb>=1.5",
     "sentence-transformers>=3.4,<4",
     "numpy<2",
     "scipy<1.13",
     "scikit-learn<1.5",
 ]
+
+[project.optional-dependencies]
 dev = [
     "mypy>=1.13",
     "ruff>=0.7",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "httpx>=0.27",
-    "agent-service[langchain,rag]",
 ]
 
 [build-system]

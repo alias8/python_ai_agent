@@ -1,11 +1,11 @@
-"""Tool business logic and input models — framework-agnostic.
+"""Tool business logic and input models, kept separate from the LangChain
+wrapping in langchain/tools.py.
 
-Used by both direct_api/tools.py (wrapped as Claude ToolParam + dispatch)
-and langchain/tools.py (wrapped as LangChain @tool objects), so both
-implementations are doing identical work underneath. Pydantic models are
-shared too: direct_api generates Claude's JSON Schema straight off them via
-model_json_schema(), and langchain passes them as a tool's args_schema
-directly — no framework needs a hand-written schema duplicating the model.
+Each tool's Pydantic input model is passed to LangChain as the tool's
+args_schema directly, so the same model both validates Claude's tool input
+and generates the JSON Schema Claude sees — no hand-written schema to drift
+out of sync with it. search_knowledge_base's implementation lives in
+langchain/knowledge_base.py; only its input model is here.
 """
 
 import random
@@ -15,10 +15,9 @@ from pydantic import BaseModel, Field
 from .exceptions import TransientToolError
 
 # Toggle the tools' simulated flaky-service failures below. On by design —
-# it's what exercises direct_api's retry/backoff path and is how the
-# langchain/ vs. ai-agent-demo's TS langchain/ tool-error-handling difference
-# documented in the README was actually found, rather than assumed from
-# docs. Set to False when you want a deterministic run, e.g. stepping
+# it's how the langchain/ vs. ai-agent-demo's TS langchain/ tool-error-handling
+# difference documented in the README was actually found, rather than
+# assumed from docs. Set to False when you want a deterministic run, e.g. stepping
 # through the happy path in a debugger without a ~40%/~30% chance of
 # instead landing in the crash path on every call.
 SIMULATE_TOOL_FAILURES = True
@@ -56,34 +55,6 @@ def lookup_order_status(input: LookupOrderStatusInput) -> str:
     if order is None:
         return f'Error: no order found with ID "{input.order_id}"'
     return f"order {input.order_id}: {order}"
-
-
-_MOCK_KB_ARTICLES: list[dict[str, str]] = [
-    {
-        "title": "Return policy",
-        "body": "Items can be returned within 30 days of delivery for a full refund.",
-    },
-    {
-        "title": "Shipping times",
-        "body": "Standard shipping takes 3-5 business days; expedited takes 1-2.",
-    },
-    {
-        "title": "Account recovery",
-        "body": "Use the 'forgot password' link on the login page to reset your account.",
-    },
-]
-
-
-def search_knowledge_base(input: SearchKnowledgeBaseInput) -> str:
-    terms = input.query.strip().lower().split()
-    matches = [
-        article
-        for article in _MOCK_KB_ARTICLES
-        if any(term in article["title"].lower() or term in article["body"].lower() for term in terms)
-    ]
-    if not matches:
-        return f'No knowledge base articles matched "{input.query}"'
-    return "; ".join(f"{a['title']}: {a['body']}" for a in matches)
 
 
 def send_notification(input: SendNotificationInput) -> str:

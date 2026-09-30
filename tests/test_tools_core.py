@@ -24,18 +24,6 @@ def test_lookup_order_status_transient_failure(monkeypatch: pytest.MonkeyPatch) 
         tools_core.lookup_order_status(tools_core.LookupOrderStatusInput(order_id="ORD-1042"))
 
 
-def test_search_knowledge_base_match() -> None:
-    result = tools_core.search_knowledge_base(tools_core.SearchKnowledgeBaseInput(query="return policy"))
-    assert "30 days" in result
-
-
-def test_search_knowledge_base_no_match() -> None:
-    result = tools_core.search_knowledge_base(
-        tools_core.SearchKnowledgeBaseInput(query="spaceship warranty")
-    )
-    assert result.startswith("No knowledge base articles matched")
-
-
 def test_send_notification_success(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("agent_service.shared.tools_core.random.random", lambda: 0.9)
     result = tools_core.send_notification(tools_core.SendNotificationInput(user_id="user-88", message="hi"))

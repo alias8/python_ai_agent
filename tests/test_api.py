@@ -36,3 +36,24 @@ def test_chat_endpoint_returns_agent_answer(client: TestClient, monkeypatch: pyt
 def test_chat_endpoint_rejects_empty_message(client: TestClient) -> None:
     response = client.post("/chat", json={"message": ""})
     assert response.status_code == 422
+
+
+def test_chat_endpoint_passes_allowlist_to_agent(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+
+    async def fake_run_agent(_message: str, **kwargs: Any) -> str:
+        seen.update(kwargs)
+        return "mocked answer"
+
+    monkeypatch.setattr("agent_service.main.run_agent", fake_run_agent)
+    response = client.post(
+        "/chat", json={"message": "hi", "allowed_tools": ["search_knowledge_base"]}
+    )
+    assert response.status_code == 200
+    assert seen["allowed_tools"] == ["search_knowledge_base"]
+
+
+def test_chat_endpoint_rejects_unknown_tool_in_allowlist(client: TestClient) -> None:
+    response = client.post("/chat", json={"message": "hi", "allowed_tools": ["delete_everything"]})
+    assert response.status_code == 422
+    assert "delete_everything" in response.json()["detail"]

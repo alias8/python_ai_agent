@@ -1,15 +1,11 @@
 """Semantic search over the support knowledge base — LangChain-only.
 
-Upgrades shared/tools_core.py's search_knowledge_base (a literal substring/
-keyword match) to real embedding-based retrieval: articles and the query are
-both embedded with a local sentence-transformers model, and matches are
-found by vector similarity in a ChromaDB collection, not literal word
-overlap. Kept out of shared/ on purpose — direct_api keeps the original
-keyword version, so the two implementations now differ in retrieval
-strategy, not just loop mechanics. That's its own comparison worth having:
-see the README for a query ("how do I send something back") that only the semantic
-version answers correctly, having no words in common with the article that
-answers it.
+Embedding-based retrieval, replacing the project's original literal
+substring/keyword match: articles and the query are both embedded with a
+local sentence-transformers model, and matches are found by vector
+similarity in a ChromaDB collection, not literal word overlap — so "how do
+I send something back" finds the returns article with no words in common
+with it. Retrieval quality is measured by evals/kb_eval.py.
 
 Runs fully locally: sentence-transformers downloads its model (~90MB, once,
 cached under ~/.cache/huggingface) the first time it's used; both the

@@ -1,23 +1,18 @@
-"""The same job as direct_api/agent.py, built with LangChain's create_agent()
-instead of a hand-rolled loop.
+"""The agent loop, built with LangChain's create_agent().
 
-Sibling of ai-agent-demo's src/langchain/agent.ts — see that file's comments
-for the fuller comparison. The short version: this replaces essentially all
-of direct_api/agent.py. The growing message array, the tool_use/tool_result
-wiring, and the "loop until no more tool calls" condition are all built into
-create_agent()'s underlying LangGraph state machine. What direct_api/agent.py
-spells out by hand happens here in the two lines building `_agent` and the
-one line calling `_agent.invoke(...)` below — the real framework tradeoff:
-dramatically less code to write, but the loop mechanics are no longer
-something you can point at and read.
+Sibling of ai-agent-demo's src/langchain/agent.ts. The growing message
+array, the tool_use/tool_result wiring, and the "loop until no more tool
+calls" condition are all built into create_agent()'s underlying LangGraph
+state machine — the framework tradeoff: much less code to write, but the
+loop mechanics are no longer something you can point at and read.
 
-None of direct_api's other production-readiness ports (retry/backoff, tool
-scoping) are reimplemented here on purpose, to keep the comparison focused
-on what the framework gives you unmodified — see the project README for
-what LangChain provides by default instead.
+No retry/backoff is added around tools — see the project README for what
+LangChain does by default when a tool raises.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from functools import lru_cache
+from typing import Any
 
 from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
@@ -29,11 +24,9 @@ from ..shared.config import get_settings
 from ..shared.trace import trace_api_error, trace_final_answer, trace_max_iterations
 from .tools import LANGCHAIN_TOOLS, reset_call_sequence
 
-# LangGraph's own default, not directly comparable to direct_api's
-# MAX_ITERATIONS=8 — LangGraph counts each graph "super-step" (roughly: one
+# LangGraph's own default. It counts each graph "super-step" (roughly: one
 # model call, or one batch of tool executions), not one full
-# model-call-then-tools round trip the way the hand-rolled loop counts, so
-# the same number means something different here.
+# model-call-then-tools round trip.
 RECURSION_LIMIT = 25
 
 SYSTEM_PROMPT = (
@@ -55,7 +48,30 @@ _model = ChatAnthropic(
     max_tokens=1024,
 )
 
-_agent = create_agent(model=_model, tools=LANGCHAIN_TOOLS, system_prompt=SYSTEM_PROMPT)
+_TOOLS_BY_NAME = {t.name: t for t in LANGCHAIN_TOOLS}
+
+
+def select_tools(allowed_tools: Sequence[str] | None) -> tuple[str, ...]:
+    """The tool names a run may use: all of them when allowed_tools is None,
+    otherwise exactly the allowlist. Raises ValueError on an unknown name
+    rather than silently ignoring it — a typo in an allowlist should fail
+    loudly, not quietly grant or drop access."""
+    if allowed_tools is None:
+        return tuple(_TOOLS_BY_NAME)
+    unknown = sorted(set(allowed_tools) - _TOOLS_BY_NAME.keys())
+    if unknown:
+        raise ValueError(f"unknown tool(s) in allowed_tools: {', '.join(unknown)}")
+    return tuple(name for name in _TOOLS_BY_NAME if name in allowed_tools)
+
+
+@lru_cache
+def _get_agent(tool_names: tuple[str, ...]) -> Any:
+    # Tool scoping is enforced by only giving the agent the allowed tools at
+    # all — Claude never sees the others' schemas, so it can't call them.
+    # One compiled graph per distinct allowlist, cached, since building one
+    # isn't free and the set of allowlists in practice is small.
+    tools = [_TOOLS_BY_NAME[name] for name in tool_names]
+    return create_agent(model=_model, tools=tools, system_prompt=SYSTEM_PROMPT)
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -68,17 +84,22 @@ def _message_text(message: BaseMessage) -> str:
     return "(no text response)"
 
 
-async def run_agent(user_message: str, on_step: OnStep | None = None) -> str:
+async def run_agent(
+    user_message: str,
+    on_step: OnStep | None = None,
+    allowed_tools: Sequence[str] | None = None,
+) -> str:
+    agent = _get_agent(select_tools(allowed_tools))
     reset_call_sequence()
 
     try:
-        result = await _agent.ainvoke(
+        result = await agent.ainvoke(
             {"messages": [{"role": "user", "content": user_message}]},
             {"recursion_limit": RECURSION_LIMIT},
         )
     except GraphRecursionError:
-        # Analogous to direct_api hitting MAX_ITERATIONS, though — per the
-        # comment above — "recursion_limit" isn't counting the same unit.
+        # The loop never produced a final answer within RECURSION_LIMIT
+        # super-steps (see the comment on it above).
         trace_max_iterations(iterations=RECURSION_LIMIT)
         return "(stopped: hit the graph recursion limit without a final answer)"
     except Exception as exc:
@@ -87,13 +108,12 @@ async def run_agent(user_message: str, on_step: OnStep | None = None) -> str:
 
     messages: list[BaseMessage] = result["messages"]
 
-    # create_agent() doesn't expose a per-step callback the way the
-    # hand-rolled loop's on_step parameter does, so this reconstructs the
-    # same step-by-step console output after the fact by walking the final
-    # message list — every tool call and tool result is already in there,
-    # just not surfaced live. (Tool calls are traced as they actually
-    # happen, inside tools.py — this loop is only about matching
-    # direct_api's printed console output.)
+    # create_agent() doesn't expose a per-step callback, so this
+    # reconstructs step-by-step console output after the fact by walking the
+    # final message list — every tool call and tool result is already in
+    # there, just not surfaced live. (Tool calls are traced as they actually
+    # happen, inside tools.py — this loop is only for the CLI's printed
+    # output.)
     if on_step is not None:
         for message in messages:
             if isinstance(message, AIMessage) and message.tool_calls:

@@ -1,5 +1,4 @@
-"""A REPL entry point equivalent to direct_api's CLI, for exercising the
-LangChain implementation of the agent loop the same way."""
+"""A REPL entry point for exercising the agent loop interactively."""
 
 import asyncio
 
