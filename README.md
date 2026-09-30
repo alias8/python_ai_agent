@@ -32,9 +32,11 @@ src/agent_service/
     agent.py         the agentic loop: retry/backoff (tenacity), loop detection, tool scoping
     cli.py           REPL entry point, same shape as ai-agent-demo's direct-api CLI
   langchain/
-    tools.py         wraps tools_core as LangChain @tool objects, with the same JSONL tracing
-    agent.py         the same job via create_agent()
-    cli.py           REPL entry point, same shape as direct_api's
+    tools.py           wraps tools_core as LangChain @tool objects, with the same JSONL tracing
+    knowledge_base.py  semantic search (local embeddings + ChromaDB) — replaces search_knowledge_base,
+                       LangChain-only; direct_api keeps the naive keyword version
+    agent.py           the same job via create_agent()
+    cli.py             REPL entry point, same shape as direct_api's
   schemas.py        API request/response models
   main.py           FastAPI app (/health, /chat) — runs on direct_api, LangChain is CLI-only
 tests/              pytest + pytest-asyncio, Anthropic API mocked via a fake client
@@ -44,8 +46,8 @@ tests/              pytest + pytest-asyncio, Anthropic API mocked via a fake cli
 
 A customer-support flavor rather than ai-agent-demo's calculator/weather/units, chosen to be a distinct demo rather than a port of the same three tools. Defined once in `shared/tools_core.py` and wrapped in each implementation's own schema format (a Claude `ToolParam` built from `model_json_schema()` for `direct_api`, the same Pydantic model passed straight in as a LangChain tool's `args_schema` for `langchain`) so both implementations are doing identical work underneath:
 
-- `lookup_order_status(order_id)` — mock order lookup; simulates the backing service being flaky (~40% of calls raise a retryable `TransientToolError`)
-- `search_knowledge_base(query)` — keyword search over a small in-memory article set
+- `lookup_order_status(order_id)` — mock order lookup; simulates the backing service being flaky (~40% of calls raise a retryable `TransientToolError`, toggle: `shared/tools_core.SIMULATE_TOOL_FAILURES`)
+- `search_knowledge_base(query)` — keyword search over a small in-memory article set in `direct_api`; real semantic (embedding-based) search over the same articles in `langchain` — see below
 - `send_notification(user_id, message)` — a mock action tool with a side effect, independently flaky (~30%)
 
 ## How langchain/ works
@@ -56,6 +58,21 @@ result = await _agent.ainvoke({"messages": [{"role": "user", "content": user_mes
 ```
 
 That's the entire loop. `create_agent()` (from the `langchain` package, matching `ai-agent-demo`'s TypeScript `createAgent()`) builds a LangGraph state machine that does everything `direct_api/agent.py` spells out by hand: the growing message list, the tool_use/tool_result wiring, the loop-until-no-more-tool-calls condition. None of `direct_api`'s other production-readiness ports (retry/backoff, tool scoping) are reimplemented here on purpose, to keep the comparison focused on what the framework gives you unmodified.
+
+## RAG: langchain/'s search_knowledge_base is semantic, direct_api's isn't
+
+`direct_api`'s `search_knowledge_base` (`shared/tools_core.py`) is a literal substring/keyword match: split the query into words, keep any article whose title or body contains one of them. `langchain/knowledge_base.py` replaces that, LangChain-only, with real retrieval:
+
+1. Each KB article is embedded once with a local `sentence-transformers` model (`all-MiniLM-L6-v2`, 384-dim, no API key — runs in-process) and stored in an in-memory ChromaDB collection.
+2. A query is embedded the same way and matched against the collection by cosine similarity, not word overlap.
+3. A relevance cutoff (`_RELEVANCE_THRESHOLD = 0.35`, picked empirically — see the comment in `knowledge_base.py`) filters out the "least-bad" result when nothing is actually relevant, rather than always returning a top match regardless of quality.
+
+Kept deliberately out of `shared/` — `direct_api` still uses the naive keyword version, so the two implementations now differ in retrieval strategy as well as loop mechanics, which turned out to produce a real, verifiable before/after rather than a contrived one. Querying both with **"how do I send something back"** (zero words in common with the article that answers it):
+
+- **`direct_api`** (keyword) returns **all three** articles — not because they're all relevant, but because splitting the query into words includes the single-letter term `"i"`, which substring-matches every article in the set. A real, pre-existing bug in the naive version, not a contrived example.
+- **`langchain`** (semantic) returns just `Return policy: Items can be returned within 30 days of delivery for a full refund.` — the right answer, despite no shared keywords.
+
+And for a genuinely unrelated query like **"spaceship warranty"**, `langchain` correctly returns "No knowledge base articles matched" (best score ~0.25, below the 0.35 cutoff) rather than confidently citing whichever article happened to score highest.
 
 ## What happens on a tool failure (tested, not assumed)
 
@@ -69,8 +86,8 @@ The TypeScript and Python LangChain ecosystems don't even agree with each other 
 ## Running it
 
 ```
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"        # includes langchain + langchain-anthropic
+python3.12 -m venv .venv && source .venv/bin/activate   # must be 3.12, see pyproject.toml's rag extra
+pip install -e ".[dev]"        # includes langchain + langchain-anthropic + chromadb/sentence-transformers
 cp .env.example .env   # add your ANTHROPIC_API_KEY
 
 # HTTP API (direct_api only)
@@ -87,10 +104,12 @@ python -m agent_service.langchain.cli
 ```
 ruff check .      # lint
 mypy              # strict type check — includes pydantic's mypy plugin, needed for LangChain's Pydantic-based model classes
-pytest -q         # unit + integration tests (fake Anthropic client, no network/API key needed)
+pytest -q         # unit + integration tests
 ```
 
-All three run in CI on every push/PR (`.github/workflows/ci.yml`). There's no automated test for `langchain/agent.py`'s full `create_agent()` run (mocking LangGraph's internals deep enough to be worth it wasn't — the tool-failure finding above was verified with a one-off scripted fake model instead, not committed as a test); `langchain/tools.py`'s tool wrapping is unit-tested like everything else.
+All three run in CI on every push/PR (`.github/workflows/ci.yml`), which caches both pip packages and the downloaded embedding model (`actions/cache` on `~/.cache/huggingface`) to keep runs fast after the first. No `ANTHROPIC_API_KEY` or paid API call is needed for any of it — the Anthropic client is mocked (`tests/conftest.py`'s `FakeAnthropicClient`) — but `tests/test_knowledge_base.py` does load a real `sentence-transformers` model and run it against a real ChromaDB collection (network needed once, to populate a cold Hugging Face cache; local after that), because retrieval *quality* — does it actually find a keyword-free paraphrase, does it actually reject an irrelevant query — is the entire point of that module and can't be demonstrated with a mock.
+
+There's no automated test for `langchain/agent.py`'s full `create_agent()` run (mocking LangGraph's internals deep enough to be worth it wasn't — the tool-failure finding above was verified with a one-off scripted fake model instead, not committed as a test); `langchain/tools.py`'s tool wrapping and `langchain/knowledge_base.py`'s retrieval are both unit-tested like everything else.
 
 ## Status
 

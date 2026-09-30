@@ -17,10 +17,10 @@ from ..shared.tools_core import (
     SearchKnowledgeBaseInput,
     SendNotificationInput,
     lookup_order_status,
-    search_knowledge_base,
     send_notification,
 )
 from ..shared.trace import trace_tool_call
+from .knowledge_base import search_knowledge_base_semantic
 
 # A per-process call sequence number, standing in for direct_api's loop
 # iteration index. create_agent()'s underlying LangGraph run doesn't expose
@@ -86,8 +86,11 @@ lookup_order_status_tool: BaseTool = tool(
 search_knowledge_base_tool: BaseTool = tool(
     "search_knowledge_base",
     args_schema=SearchKnowledgeBaseInput,
-    description="Search the internal support knowledge base for articles matching a query.",
-)(_traced("search_knowledge_base", SearchKnowledgeBaseInput, search_knowledge_base))
+    description=(
+        "Search the internal support knowledge base for articles semantically related to a query "
+        "(embedding-based retrieval, not literal keyword matching)."
+    ),
+)(_traced("search_knowledge_base", SearchKnowledgeBaseInput, search_knowledge_base_semantic))
 
 send_notification_tool: BaseTool = tool(
     "send_notification",

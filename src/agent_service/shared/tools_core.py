@@ -21,7 +21,7 @@ from .exceptions import TransientToolError
 # docs. Set to False when you want a deterministic run, e.g. stepping
 # through the happy path in a debugger without a ~40%/~30% chance of
 # instead landing in the crash path on every call.
-SIMULATE_TOOL_FAILURES = False
+SIMULATE_TOOL_FAILURES = True
 
 
 class LookupOrderStatusInput(BaseModel):
