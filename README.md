@@ -63,16 +63,38 @@ That's the entire loop. `create_agent()` (from the `langchain` package, matching
 
 `direct_api`'s `search_knowledge_base` (`shared/tools_core.py`) is a literal substring/keyword match: split the query into words, keep any article whose title or body contains one of them. `langchain/knowledge_base.py` replaces that, LangChain-only, with real retrieval:
 
-1. Each KB article is embedded once with a local `sentence-transformers` model (`all-MiniLM-L6-v2`, 384-dim, no API key — runs in-process) and stored in an in-memory ChromaDB collection.
+1. The knowledge base is 17 realistic help-center articles (`langchain/kb_articles/`, one Markdown file each, ~400 words / 465-580 tokens). Each is embedded once with a local `sentence-transformers` model (`all-MiniLM-L6-v2`, 384-dim, no API key — runs in-process) and stored in an in-memory ChromaDB collection.
 2. A query is embedded the same way and matched against the collection by cosine similarity, not word overlap.
-3. A relevance cutoff (`_RELEVANCE_THRESHOLD = 0.35`, picked empirically — see the comment in `knowledge_base.py`) filters out the "least-bad" result when nothing is actually relevant, rather than always returning a top match regardless of quality.
+3. The tool returns at most the top 3 articles, and only those above a relevance cutoff (`_RELEVANCE_THRESHOLD = 0.35`) — so when nothing is actually relevant it says so, rather than confidently citing the "least-bad" article.
 
-Kept deliberately out of `shared/` — `direct_api` still uses the naive keyword version, so the two implementations now differ in retrieval strategy as well as loop mechanics, which turned out to produce a real, verifiable before/after rather than a contrived one. Querying both with **"how do I send something back"** (zero words in common with the article that answers it):
+Kept deliberately out of `shared/` — `direct_api` still uses the naive keyword version, so the two implementations differ in retrieval strategy as well as loop mechanics. The comparison was made while both searched the same three one-sentence articles, querying with **"how do I send something back"** (zero words in common with the article that answers it):
 
-- **`direct_api`** (keyword) returns **all three** articles — not because they're all relevant, but because splitting the query into words includes the single-letter term `"i"`, which substring-matches every article in the set. A real, pre-existing bug in the naive version, not a contrived example.
-- **`langchain`** (semantic) returns just `Return policy: Items can be returned within 30 days of delivery for a full refund.` — the right answer, despite no shared keywords.
+- **`direct_api`** (keyword) returned **all three** articles — not because they're all relevant, but because splitting the query into words includes the single-letter term `"i"`, which substring-matches every article in the set. A real, pre-existing bug in the naive version, not a contrived example.
+- **`langchain`** (semantic) returned just the return policy — the right answer, despite no shared keywords.
 
-And for a genuinely unrelated query like **"spaceship warranty"**, `langchain` correctly returns "No knowledge base articles matched" (best score ~0.25, below the 0.35 cutoff) rather than confidently citing whichever article happened to score highest.
+`direct_api` is no longer being developed; all further retrieval work happens in `langchain/` only, which now has its own, larger corpus.
+
+### Measuring retrieval: `python -m evals.kb_eval`
+
+With a realistic corpus, "try a couple of queries and eyeball it" stops working, so retrieval is scored against a labeled set: `evals/kb_eval_queries.json` has 54 queries — 38 natural-language paraphrases, 7 exact-identifier queries (payment error codes like `E-4020`, plan names), and 9 unrelated ones that should return nothing, including near-misses like "how do I return a rental car". Each answerable query names the article(s) that answer it and quotes the exact evidence sentence; `tests/test_kb_eval_data.py` checks every label points at a real article and a real quote.
+
+Baseline (one vector per whole article, 0.35 cutoff):
+
+| | n | hit@1 | hit@3 | MRR |
+| --- | --- | --- | --- | --- |
+| all answerable | 45 | 73.3% | 93.3% | 0.827 |
+| paraphrase | 38 | 78.9% | 97.4% | 0.871 |
+| identifier | 7 | 42.9% | 71.4% | 0.592 |
+| evidence inside the 256-token window | 20 | 80.0% | 100.0% | 0.883 |
+| evidence past the window | 25 | 68.0% | 88.0% | 0.782 |
+
+What it shows:
+
+- **Every article is truncated.** `all-MiniLM-L6-v2` embeds only the first 256 tokens and silently drops the rest, so roughly half of each article is never embedded. Queries answered past the cutoff do measurably worse — they only succeed because the article's opening happens to be on-topic. This is what chunking fixes.
+- **Exact identifiers are the weak spot.** Error codes like `E-6002` are near-meaningless to an embedding model (hit@1 43%); this is what hybrid keyword + vector search fixes.
+- **The 0.35 cutoff no longer fits.** It was tuned on one-sentence articles; long-article vectors are diluted, so real matches score lower. At 0.35 only 64% of answerable queries get their answer back (vs 93% in the top 3 with no cutoff), while rejecting 89% of unrelated ones. A threshold is specific to a model *and* a corpus — it has to be re-tuned whenever either changes, which is why it isn't re-tuned until after chunking.
+
+Retrieval roadmap, each step measured against this eval: chunking → pgvector (with milestone 2's Postgres) → hybrid search via Postgres full-text + vector ranking → tenant filtering. Order lookups get server-side authorization separately — per-customer order data is a database query scoped to the authenticated customer, not something to put in a vector index.
 
 ## What happens on a tool failure (tested, not assumed)
 
@@ -105,6 +127,7 @@ python -m agent_service.langchain.cli
 ruff check .      # lint
 mypy              # strict type check — includes pydantic's mypy plugin, needed for LangChain's Pydantic-based model classes
 pytest -q         # unit + integration tests
+python -m evals.kb_eval  # retrieval quality report (not run in CI — it reports numbers, it doesn't pass/fail)
 ```
 
 All three run in CI on every push/PR (`.github/workflows/ci.yml`), which caches both pip packages and the downloaded embedding model (`actions/cache` on `~/.cache/huggingface`) to keep runs fast after the first. No `ANTHROPIC_API_KEY` or paid API call is needed for any of it — the Anthropic client is mocked (`tests/conftest.py`'s `FakeAnthropicClient`) — but `tests/test_knowledge_base.py` does load a real `sentence-transformers` model and run it against a real ChromaDB collection (network needed once, to populate a cold Hugging Face cache; local after that), because retrieval *quality* — does it actually find a keyword-free paraphrase, does it actually reject an irrelevant query — is the entire point of that module and can't be demonstrated with a mock.
