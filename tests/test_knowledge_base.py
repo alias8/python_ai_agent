@@ -12,9 +12,11 @@ import pytest
 
 from agent_service.langchain import knowledge_base
 from agent_service.langchain.knowledge_base import (
+    _RELEVANCE_THRESHOLD,
     _TOP_K,
     count_tokens,
     get_chunks,
+    search_chunks,
     search_knowledge_base_semantic,
 )
 from agent_service.shared.tools_core import SearchKnowledgeBaseInput
@@ -76,3 +78,26 @@ def test_search_refuses_vectors_from_a_different_embedding_model(monkeypatch: py
             search_knowledge_base_semantic(SearchKnowledgeBaseInput(query="refund"))
     finally:
         knowledge_base._check_index_ready.cache_clear()
+
+
+def test_exact_identifier_is_kept_by_keyword_match_despite_a_low_embedding_score() -> None:
+    # A bare error code embeds poorly: the right chunk ranks first but scores
+    # under the cosine cutoff. Hybrid search keeps it because the chunk
+    # contains the query's exact terms.
+    top = search_chunks("E-6002", k=1)[0]
+    assert top.chunk.id.startswith("gift-cards-and-promo-codes#")
+    assert top.similarity < _RELEVANCE_THRESHOLD
+    assert top.keyword_match
+    result = search_knowledge_base_semantic(SearchKnowledgeBaseInput(query="E-6002"))
+    assert "E-6002: Minimum not met." in result
+
+
+def test_identifier_not_in_the_knowledge_base_matches_nothing() -> None:
+    # Order numbers belong to lookup_order_status, not the knowledge base;
+    # an identifier-shaped query mustn't pull in chunks on shared words alone.
+    result = search_knowledge_base_semantic(SearchKnowledgeBaseInput(query="where is order ORD-1042"))
+    assert result.startswith("No knowledge base articles matched")
+
+
+def test_all_stopword_query_skips_keyword_search_without_error() -> None:
+    assert all(not s.keyword_match for s in search_chunks("how do I", k=_TOP_K))

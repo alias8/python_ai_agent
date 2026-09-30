@@ -17,6 +17,7 @@ call once it's cached.
 
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import Any
 
 from sentence_transformers import SentenceTransformer
 from sqlalchemy import func, select
@@ -39,12 +40,16 @@ _MAX_CHUNK_TOKENS = 200
 # the query — real retrieval needs a relevance cutoff, not just "return the
 # top result no matter what".
 #
-# Tuned from `python -m evals.kb_eval`'s threshold sweep after chunking. At
-# 0.40, 80% of answerable queries get their answer text back while 8 of 9
-# unrelated queries get nothing; 0.45 rejects all 9 but drops answer recall
-# to 69%. The lower value wins because the agent is a second filter: it can
-# ignore a loosely related chunk, but it can't answer from a chunk it never
-# received. Caveat: tuned on the same 54 queries it's evaluated on, so the
+# A chunk that contains every term of the query (see _keyword_query) is kept
+# even below this cutoff — that's hybrid search's job here, since exact
+# identifiers like "E-6002" embed poorly and score just under it.
+#
+# Tuned from `python -m evals.kb_eval`'s threshold sweep. At 0.40 (with the
+# keyword rule), 86% of answerable queries get their answer text back and 9
+# of 10 unrelated queries get nothing; 0.45 rejects all 10 but drops answer
+# recall to 79%. The lower value wins because the agent is a second filter:
+# it can ignore a loosely related chunk, but it can't answer from a chunk it
+# never received. Caveat: tuned on the same queries it's evaluated on, so the
 # numbers are optimistic — a held-out split is the fix once the set grows.
 # Re-tune after any change to the model, the corpus, or the chunking.
 _RELEVANCE_THRESHOLD = 0.40
@@ -60,6 +65,11 @@ _TOP_K = 5
 class ScoredChunk:
     chunk: Chunk
     similarity: float  # cosine similarity: 1 - pgvector's cosine distance (<=>)
+    keyword_match: bool  # the chunk contains every term in the query
+
+
+def is_relevant(scored: ScoredChunk) -> bool:
+    return scored.similarity >= _RELEVANCE_THRESHOLD or scored.keyword_match
 
 
 @lru_cache
@@ -126,40 +136,85 @@ _MIN_EF_SEARCH = 40
 _MAX_EF_SEARCH = 1000
 
 
+# Each side of hybrid search contributes its top candidates to the fusion.
+_MIN_CANDIDATES = 50
+
+# Reciprocal rank fusion's constant: a chunk's fused score is the sum over
+# rankings of 1 / (_RRF_K + its rank there). 60 is the value from the paper
+# that introduced RRF and the usual default; it damps the gap between rank 1
+# and rank 2 so neither ranking can dominate on a single top result.
+_RRF_K = 60
+
+
+def _keyword_query(query: str) -> Any:
+    # plainto_tsquery ANDs every term: a chunk matches only if it contains
+    # all of them (after stemming and stopword removal). That's deliberate.
+    # Matching ANY term (OR) let common words through — "what time does your
+    # store open" matched chunks mentioning "time", and unrelated-query
+    # rejection fell from 90% to 20% in evals/kb_eval.py. Requiring every
+    # term keeps keyword matches rare and strong: they fire for exact
+    # identifiers ("E-6002", "$99 freight fee"), where they're needed.
+    return func.plainto_tsquery("english", query)
+
+
+def _to_scored(row: KBChunkRow, distance: float, keyword_match: bool) -> ScoredChunk:
+    chunk = Chunk(
+        id=row.id,
+        article_id=row.article_id,
+        article_title=row.article_title,
+        heading=row.heading,
+        text=row.text,
+    )
+    return ScoredChunk(chunk=chunk, similarity=1 - distance, keyword_match=keyword_match)
+
+
 def search_chunks(query: str, k: int) -> list[ScoredChunk]:
-    """Top-k chunks by similarity, best first, with no relevance cutoff
-    applied — the raw ranking, which evals/kb_eval.py scores directly."""
+    """Top-k chunks, best first: vector search and keyword search fused with
+    reciprocal rank fusion. No relevance cutoff is applied — that's
+    is_relevant()'s job — so evals/kb_eval.py can score the raw ranking."""
     _check_index_ready()
     query_vector = _get_model().encode(query).tolist()
     distance = KBChunkRow.embedding.cosine_distance(query_vector)
-    ef_search = min(max(k, _MIN_EF_SEARCH), _MAX_EF_SEARCH)
+    tsquery = _keyword_query(query)
+    candidates = max(k, _MIN_CANDIDATES)
+    ef_search = min(max(candidates, _MIN_EF_SEARCH), _MAX_EF_SEARCH)
 
     with new_session() as session:
         # set_config(..., true) is SET LOCAL: it lasts only for this
         # transaction, so it never leaks to other users of the pooled connection.
         session.execute(select(func.set_config("hnsw.ef_search", str(ef_search), True)))
-        rows = session.execute(select(KBChunkRow, distance.label("distance")).order_by(distance).limit(k))
-        return [
-            ScoredChunk(
-                chunk=Chunk(
-                    id=row.id,
-                    article_id=row.article_id,
-                    article_title=row.article_title,
-                    heading=row.heading,
-                    text=row.text,
-                ),
-                similarity=1 - dist,
-            )
-            for row, dist in rows
-        ]
+        vector_rows = session.execute(
+            select(KBChunkRow, distance).order_by(distance).limit(candidates)
+        ).all()
+        keyword_ids = session.scalars(
+            select(KBChunkRow.id)
+            # numnode = 0 means the query was all stopwords ("how do I"):
+            # nothing to match, and Postgres would warn on every row.
+            .where(func.numnode(tsquery) > 0, KBChunkRow.search_vector.op("@@")(tsquery))
+            .order_by(func.ts_rank_cd(KBChunkRow.search_vector, tsquery).desc())
+            .limit(candidates)
+        ).all()
+
+        rows = {row.id: (row, dist) for row, dist in vector_rows}
+        # Keyword matches the vector side didn't rank highly enough to fetch.
+        missing = [chunk_id for chunk_id in keyword_ids if chunk_id not in rows]
+        if missing:
+            for row, dist in session.execute(
+                select(KBChunkRow, distance).where(KBChunkRow.id.in_(missing))
+            ):
+                rows[row.id] = (row, dist)
+
+    fused: dict[str, float] = {}
+    for ranking in ([row.id for row, _ in vector_rows], keyword_ids):
+        for rank, chunk_id in enumerate(ranking, start=1):
+            fused[chunk_id] = fused.get(chunk_id, 0.0) + 1 / (_RRF_K + rank)
+    keyword_set = set(keyword_ids)
+    ranked = sorted(fused, key=lambda chunk_id: fused[chunk_id], reverse=True)[:k]
+    return [_to_scored(*rows[chunk_id], keyword_match=chunk_id in keyword_set) for chunk_id in ranked]
 
 
 def search_knowledge_base_semantic(input: SearchKnowledgeBaseInput) -> str:
-    matches = [
-        scored
-        for scored in search_chunks(input.query, k=_TOP_K)
-        if scored.similarity >= _RELEVANCE_THRESHOLD
-    ]
+    matches = [scored for scored in search_chunks(input.query, k=_TOP_K) if is_relevant(scored)]
     if not matches:
         return f'No knowledge base articles matched "{input.query}"'
     return "\n\n---\n\n".join(f"# {m.chunk.context}\n\n{m.chunk.text}" for m in matches)

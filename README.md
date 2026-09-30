@@ -29,10 +29,10 @@ src/agent_service/
     trace.py        JSONL tracing, ported from ai-agent-demo's shared/trace.ts
   langchain/
     tools.py           wraps the tools as LangChain @tool objects, with JSONL tracing
-    knowledge_base.py  semantic search (local embeddings + pgvector)
+    knowledge_base.py  hybrid search (local embeddings + pgvector, Postgres full-text, RRF)
     kb_corpus.py       loads kb_articles/ (17 Markdown help-center articles)
     chunking.py        splits articles into section-based chunks
-    kb_models.py       the kb_chunks table (SQLAlchemy + pgvector)
+    kb_models.py       the kb_chunks table (SQLAlchemy + pgvector + a full-text tsvector column)
     kb_ingest.py       embeds chunks into Postgres, incrementally
     agent.py           the agent loop via create_agent(), with a per-request tool allowlist
     cli.py             REPL entry point
@@ -69,8 +69,8 @@ That's the entire loop. `create_agent()` (from the `langchain` package, matching
 1. The knowledge base is 17 realistic help-center articles (`langchain/kb_articles/`, one Markdown file each, ~400 words / 465-580 tokens).
 2. Each article is split into chunks along its own `##` sections (`langchain/chunking.py`) — 109 chunks of 25-195 tokens, each small enough that the embedding model reads all of it.
 3. Ingestion (`python -m agent_service.langchain.kb_ingest`) embeds each chunk, with its article title and section heading prefixed, using a local `sentence-transformers` model (`all-MiniLM-L6-v2`, 384-dim, no API key — runs in-process), and writes it to a Postgres `kb_chunks` table: a pgvector `vector(384)` column with an HNSW index for cosine distance.
-4. A query is embedded the same way and matched against the chunks in SQL by cosine distance (pgvector's `<=>`), not word overlap.
-5. The tool returns at most the top 5 chunks, each under its article and section heading, and only those above a relevance cutoff (`_RELEVANCE_THRESHOLD = 0.40`) — so when nothing is actually relevant it says so, rather than confidently citing the "least-bad" match.
+4. Search is hybrid: the query is embedded the same way and matched against the chunks by cosine distance (pgvector's `<=>`), and separately run as a Postgres full-text query against a generated `tsvector` column; the two rankings are merged with reciprocal rank fusion.
+5. The tool returns at most the top 5 chunks, each under its article and section heading, keeping only those above a relevance cutoff (`_RELEVANCE_THRESHOLD = 0.40`) or containing every term of the query — so when nothing is actually relevant it says so, rather than confidently citing the "least-bad" match.
 
 ### Postgres + pgvector, not an in-process vector store
 
@@ -87,7 +87,7 @@ The original motivating comparison, made when the knowledge base was three one-s
 
 ### Measuring retrieval: `python -m evals.kb_eval`
 
-With a realistic corpus, "try a couple of queries and eyeball it" stops working, so retrieval is scored against a labeled set: `evals/kb_eval_queries.json` has 54 queries — 38 natural-language paraphrases, 7 exact-identifier queries (payment error codes like `E-4020`, plan names), and 9 unrelated ones that should return nothing, including near-misses like "how do I return a rental car". Each answerable query names the article(s) that answer it and quotes the exact evidence sentence; `tests/test_kb_eval_data.py` checks every label points at a real article and a real quote.
+With a realistic corpus, "try a couple of queries and eyeball it" stops working, so retrieval is scored against a labeled set: `evals/kb_eval_queries.json` has 67 queries — 38 natural-language paraphrases, 19 exact-identifier queries (payment error codes like `E-4020`, "APO", "$99 freight fee"), and 10 unrelated ones that should return nothing, including near-misses like "how do I return a rental car" and an order number ("where is order ORD-1042"). The chunking results below were measured on the first 54 (7 identifier, 9 unrelated); the 13 extra were added before building hybrid search, so it had something to be measured against. Each answerable query names the article(s) that answer it and quotes the exact evidence sentence; `tests/test_kb_eval_data.py` checks every label points at a real article and a real quote.
 
 Two metrics matter. **hit@k / MRR** ask whether the right *article* ranks near the top. **answer returned** is stricter: does the text the tool actually hands the agent contain the answer sentence? The right article with the wrong section still leaves the agent unable to answer.
 
@@ -110,7 +110,28 @@ What it showed, in order:
 - **The cutoff had to be re-tuned, twice.** 0.35 was tuned on the original one-sentence articles; on whole long articles it dropped a third of answerable queries, because a 500-token vector is diluted and scores lower against everything. After chunking the sweep favoured 0.40: 0.45 rejects all 9 unrelated queries but drops answer recall to 69%, and the agent can ignore a loosely related chunk but can't answer from one it never received. A threshold belongs to a model *and* a corpus *and* a chunking scheme. It's also tuned on the same 54 queries it's measured on, so the numbers are optimistic until the set is big enough for a held-out split.
 - **Chunking isn't free.** "how do I send something back" regressed: short chunks like "Returned to sender" and "send the original item back" (exchanges) now out-rank the returns article's "How to start a return", which lands 6th. Other remaining misses are the same shape — the right article, but the answer in a lower-scoring section ("the vase arrived smashed" ranks "What happens to the damaged item" above "Report the problem within 7 days"). A cross-encoder reranker over the top ~20 chunks is the usual fix.
 
-Retrieval roadmap, each step measured against this eval: ~~chunking~~ (done) → ~~pgvector~~ (done) → hybrid search via Postgres full-text + vector ranking → tenant filtering. Order lookups get server-side authorization separately — per-customer order data is a database query scoped to the authenticated customer, not something to put in a vector index.
+### Hybrid search: keyword matching for exact identifiers
+
+After chunking, vector search already *ranked* identifier queries well — all 19 had their answer in the top 5 with no cutoff. The failures were at the cutoff: for a bare `E-6002`, the right chunk ranked first at 0.35, under 0.40, and only just above a wrong chunk at 0.33. The embedding model reads "some error code", not which one. An exact keyword match is much stronger evidence than that score. So the job was deciding *which chunks count as relevant*, not reordering them — and textbook hybrid search doesn't do that.
+
+Four designs were measured before one was built (cutoff 0.40):
+
+| | answer returned | identifier answer returned | unrelated rejected |
+| --- | --- | --- | --- |
+| vector only | 80.7% | 84.2% | 90% |
+| RRF(vector, any-term keyword), cosine cutoff — the textbook version | 73.7% | 84.2% | 90% |
+| RRF(vector, any-term keyword), keep if above cutoff *or* any term matches | 86.0% | 100% | **20%** |
+| **RRF(vector, all-terms keyword), keep if above cutoff *or* every term matches** | **86.0%** | **100%** | **90%** |
+
+- **The textbook version made retrieval worse.** Postgres's `ts_rank` has no IDF — unlike BM25, a common word counts as much as a rare one — so an any-term keyword ranking fused into the vector ranking was mostly noise.
+- **Letting any keyword hit bypass the cutoff let unrelated queries through**: "what time does your store open" matches chunks mentioning "time".
+- **Requiring every query term** (`plainto_tsquery`, which ANDs them) keeps keyword matches rare and strong. They fire for exact identifiers, where they're needed, and almost never for natural-language questions, whose words are spread across chunks. All of the gain is on identifier queries; paraphrases are unchanged.
+- **Postgres's parser has quirks worth knowing:** `E-6002` becomes `'e' & '-6002'` (exact matching still works — it doesn't match `E-6001`), and `APO/FPO/DPO` becomes one token because it looks like a file path, so a query for "APO" never keyword-matches it (vector search finds that chunk anyway).
+- **Fusion has a small cost:** paraphrase hit@1 dropped from 86.8% to 84.2% (one query). "when will my package arrive" keyword-matches three chunks, and fusion lifts "If your package is late" above "When your order ships". Both are still returned.
+
+Final, cutoff 0.40: answer returned 80.7% → **86.0%**, identifier hit@1 94.7% → **100%**, unrelated rejected 90% (unchanged).
+
+Retrieval roadmap, each step measured against this eval: ~~chunking~~ (done) → ~~pgvector~~ (done) → ~~hybrid search~~ (done) → tenant filtering. Order lookups get server-side authorization separately — per-customer order data is a database query scoped to the authenticated customer, not something to put in a vector index.
 
 ## What happens on a tool failure (tested, not assumed)
 

@@ -19,9 +19,10 @@ Reports three things:
      actually contain the answer? The right article with the wrong section
      of it still leaves the agent unable to answer, so this is the stricter
      and more important number.
-2. A threshold sweep: for each cutoff, the share of answerable queries whose
-   answer text still gets returned vs the share of unrelated queries that
-   correctly get nothing back. Raising the cutoff trades the first for the
+2. A threshold sweep: for each cosine cutoff (a chunk containing every
+   query term is kept regardless, as the tool does), the share of answerable
+   queries whose answer text still gets returned vs the share of unrelated
+   queries that correctly get nothing back. Raising the cutoff trades the first for the
    second.
 3. Every query the current configuration gets wrong, with its top chunks.
 """
@@ -92,8 +93,10 @@ def _answer_returned(chunks: list[ScoredChunk], q: EvalQuery) -> bool:
 
 
 def _returned(ranking: list[ScoredChunk], cutoff: float) -> list[ScoredChunk]:
-    # What the tool hands the agent: the top-k chunks, minus any below the cutoff.
-    return [s for s in ranking[:_TOP_K] if s.similarity >= cutoff]
+    # What the tool hands the agent: the top-k chunks, minus any that are
+    # neither above the cutoff nor a keyword match (knowledge_base.is_relevant,
+    # with the cutoff as a parameter for the sweep).
+    return [s for s in ranking[:_TOP_K] if s.similarity >= cutoff or s.keyword_match]
 
 
 def _pct(numerator: int, denominator: int) -> str:
@@ -177,7 +180,8 @@ def main() -> None:
         print(f'  "{q.query}" ({q.category}) wanted: {wanted}')
         for s in rankings[q.query][:3]:
             has_answer = " <- has answer" if _answer_returned([s], q) else ""
-            print(f"      {s.similarity:.3f}  {s.chunk.id} ({s.chunk.context}){has_answer}")
+            keyword = " [keyword match]" if s.keyword_match else ""
+            print(f"      {s.similarity:.3f}  {s.chunk.id} ({s.chunk.context}){keyword}{has_answer}")
 
 
 if __name__ == "__main__":

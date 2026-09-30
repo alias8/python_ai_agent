@@ -37,7 +37,6 @@
   {"query": "how do I delete my account", "category": "paraphrase", "expected": ["privacy-and-data-requests"], "evidence": "select **Delete my account**"},
   {"query": "stop sending me promotional emails", "category": "paraphrase", "expected": ["privacy-and-data-requests"], "evidence": "You can unsubscribe from marketing emails"},
   {"query": "do you keep my orders after I close my account", "category": "paraphrase", "expected": ["privacy-and-data-requests"], "evidence": "We keep records of your orders and payments for 7 years"},
-
   {"query": "E-4020", "category": "identifier", "expected": ["payment-error-codes"], "evidence": "The billing address you entered doesn't match the address your bank has on file for the card"},
   {"query": "what does E-4031 mean", "category": "identifier", "expected": ["payment-error-codes"], "evidence": "Your bank asked you to confirm the payment"},
   {"query": "got error E-5003 at checkout, should I try again", "category": "identifier", "expected": ["payment-error-codes"], "evidence": "**Don't retry immediately.**"},
@@ -45,7 +44,18 @@
   {"query": "E-6004 code already used", "category": "identifier", "expected": ["gift-cards-and-promo-codes"], "evidence": "**E-6004: Code already used.**"},
   {"query": "Pay in 4 refund", "category": "identifier", "expected": ["payment-methods"], "evidence": "If you return items from an order paid in installments, the refund reduces your remaining payments first"},
   {"query": "Plus 60-day return window on opened electronics", "category": "identifier", "expected": ["plus-membership", "returns-and-refunds"], "evidence": "opened electronics are still subject to the restocking fee"},
-
+  {"query": "E-4045", "category": "identifier", "expected": ["payment-error-codes"], "evidence": "The card number, expiration date, or security code doesn't match"},
+  {"query": "E-4012 declined", "category": "identifier", "expected": ["payment-error-codes"], "evidence": "Your bank declined the transaction"},
+  {"query": "error E-5010", "category": "identifier", "expected": ["payment-error-codes"], "evidence": "Payments are temporarily unavailable, usually during scheduled maintenance"},
+  {"query": "E-6003", "category": "identifier", "expected": ["gift-cards-and-promo-codes"], "evidence": "Nothing in your cart qualifies for this promotion"},
+  {"query": "E-6001 promo code", "category": "identifier", "expected": ["gift-cards-and-promo-codes"], "evidence": "The promotion has ended"},
+  {"query": "APO address expedited shipping", "category": "identifier", "expected": ["shipping-options-and-delivery-times"], "evidence": "not available for PO boxes or for military APO/FPO/DPO addresses"},
+  {"query": "white glove delivery", "category": "identifier", "expected": ["shipping-options-and-delivery-times"], "evidence": "is available at checkout for an extra $79"},
+  {"query": "reply STOP to texts", "category": "identifier", "expected": ["privacy-and-data-requests"], "evidence": "from marketing texts by replying STOP"},
+  {"query": "price ending in .97", "category": "identifier", "expected": ["returns-and-refunds"], "evidence": "including clearance items with a price ending in .97"},
+  {"query": "$99 freight fee", "category": "identifier", "expected": ["shipping-options-and-delivery-times"], "evidence": "a flat $99 freight fee applies per order"},
+  {"query": "Trust this device for 30 days", "category": "identifier", "expected": ["two-factor-authentication"], "evidence": "**Trust this device for 30 days**"},
+  {"query": "16-digit gift card number and PIN", "category": "identifier", "expected": ["gift-cards-and-promo-codes"], "evidence": "enter the 16-digit card number and 4-digit PIN at checkout"},
   {"query": "what's the weather in Boston tomorrow", "category": "unrelated", "expected": []},
   {"query": "recipe for banana bread", "category": "unrelated", "expected": []},
   {"query": "who won the world cup", "category": "unrelated", "expected": []},
@@ -54,5 +64,6 @@
   {"query": "what time does your store open", "category": "unrelated", "expected": []},
   {"query": "do you sell car insurance", "category": "unrelated", "expected": []},
   {"query": "how do I reset my wifi router", "category": "unrelated", "expected": []},
-  {"query": "how do I return a rental car", "category": "unrelated", "expected": []}
+  {"query": "how do I return a rental car", "category": "unrelated", "expected": []},
+  {"query": "where is order ORD-1042", "category": "unrelated", "expected": []}
 ]

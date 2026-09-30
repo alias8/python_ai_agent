@@ -1,12 +1,18 @@
 """The knowledge base's Postgres table: one row per chunk, with its embedding."""
 
+from typing import Any
+
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Index, String, Text
+from sqlalchemy import Computed, Index, String, Text
+from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..shared.db import Base
 
 EMBEDDING_DIMENSIONS = 384  # all-MiniLM-L6-v2's output size
+
+# What keyword search matches against: the same text the embedding sees.
+SEARCH_VECTOR_SQL = "to_tsvector('english', article_title || ' ' || heading || ' ' || text)"
 
 
 class KBChunkRow(Base):
@@ -25,6 +31,10 @@ class KBChunkRow(Base):
     # sha256 of what was embedded (the model name + the chunk's embedding
     # text). Ingestion skips re-embedding any chunk whose hash is unchanged.
     content_hash: Mapped[str] = mapped_column(String(64))
+    # Postgres full-text search terms for the keyword half of hybrid search.
+    # A generated column: Postgres computes it from the columns above on
+    # every insert/update, so ingestion never has to keep it in sync.
+    search_vector: Mapped[Any] = mapped_column(TSVECTOR, Computed(SEARCH_VECTOR_SQL, persisted=True))
 
     __table_args__ = (
         # HNSW: approximate nearest-neighbour index for cosine distance (<=>).
@@ -36,4 +46,7 @@ class KBChunkRow(Base):
             postgresql_using="hnsw",
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
+        # GIN: an inverted index (term -> rows), what makes `search_vector @@
+        # query` a lookup instead of a full scan.
+        Index("kb_chunks_search_vector_gin", "search_vector", postgresql_using="gin"),
     )
