@@ -38,8 +38,8 @@
   {"query": "stop sending me promotional emails", "category": "paraphrase", "expected": ["privacy-and-data-requests"], "evidence": "You can unsubscribe from marketing emails"},
   {"query": "do you keep my orders after I close my account", "category": "paraphrase", "expected": ["privacy-and-data-requests"], "evidence": "We keep records of your orders and payments for 7 years"},
 
-  {"query": "E-4020", "category": "identifier", "expected": ["payment-error-codes"], "evidence": "## E-4020: Address verification failed"},
-  {"query": "what does E-4031 mean", "category": "identifier", "expected": ["payment-error-codes"], "evidence": "## E-4031: Card authentication failed"},
+  {"query": "E-4020", "category": "identifier", "expected": ["payment-error-codes"], "evidence": "The billing address you entered doesn't match the address your bank has on file for the card"},
+  {"query": "what does E-4031 mean", "category": "identifier", "expected": ["payment-error-codes"], "evidence": "Your bank asked you to confirm the payment"},
   {"query": "got error E-5003 at checkout, should I try again", "category": "identifier", "expected": ["payment-error-codes"], "evidence": "**Don't retry immediately.**"},
   {"query": "E-6002", "category": "identifier", "expected": ["gift-cards-and-promo-codes"], "evidence": "**E-6002: Minimum not met.**"},
   {"query": "E-6004 code already used", "category": "identifier", "expected": ["gift-cards-and-promo-codes"], "evidence": "**E-6004: Code already used.**"},

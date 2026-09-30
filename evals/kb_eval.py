@@ -11,17 +11,19 @@ Run from the repo root:
 
 Reports three things:
 
-1. Ranking quality, ignoring the threshold: hit@1, hit@3, and MRR (mean
-   reciprocal rank — 1.0 if the right article is always ranked first, 0.5 if
-   it's always second, and so on). Broken down by query category, and by
-   whether the query's evidence sits inside or past the embedding model's
-   input window — text past the window is silently truncated, never
-   embedded, so retrieval for those queries can only succeed by luck.
+1. Ranking quality, ignoring the threshold. Two levels:
+   - Article: articles ranked by their best-matching chunk — hit@1, hit@3,
+     and MRR (mean reciprocal rank: 1.0 if the right article is always
+     ranked first, 0.5 if it's always second, and so on).
+   - Answer: does the text the tool would hand the agent (its top-k chunks)
+     actually contain the answer? The right article with the wrong section
+     of it still leaves the agent unable to answer, so this is the stricter
+     and more important number.
 2. A threshold sweep: for each cutoff, the share of answerable queries whose
-   answer still gets returned (recall) vs the share of unrelated queries that
-   correctly get nothing back (rejection). Raising the cutoff trades the
-   first for the second.
-3. Every query the current configuration gets wrong, with its top 3 scores.
+   answer text still gets returned vs the share of unrelated queries that
+   correctly get nothing back. Raising the cutoff trades the first for the
+   second.
+3. Every query the current configuration gets wrong, with its top chunks.
 """
 
 import json
@@ -29,16 +31,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from agent_service.langchain.kb_corpus import KBArticle, load_articles
 from agent_service.langchain.knowledge_base import (
     _RELEVANCE_THRESHOLD,
     _TOP_K,
-    ScoredArticle,
-    _get_model,
-    rank_articles,
+    ScoredChunk,
+    count_tokens,
+    get_chunks,
+    search_chunks,
 )
 
 _QUERIES_PATH = Path(__file__).parent / "kb_eval_queries.json"
+
+# The embedding model's input window, including its 2 special tokens.
+_MODEL_WINDOW = 256
 
 Category = Literal["paraphrase", "identifier", "unrelated"]
 
@@ -51,8 +56,7 @@ class EvalQuery:
     # query, where the only correct result is nothing at all.
     expected: tuple[str, ...]
     # An exact quote of the answer, from the first expected article. Used to
-    # check the label is real, and to locate the answer relative to the
-    # model's input window.
+    # check the label is real, and to check the returned chunks contain it.
     evidence: str | None
 
 
@@ -69,24 +73,27 @@ def load_queries() -> list[EvalQuery]:
     ]
 
 
-def evidence_token_offset(article: KBArticle, evidence: str) -> int:
-    """How many tokens into the embedded text the evidence starts, counting
-    the [CLS] token the model prepends."""
-    start = article.body.index(evidence)
-    tokenizer = _get_model().tokenizer
-    return 1 + len(tokenizer(article.body[:start], add_special_tokens=False, verbose=False)["input_ids"])
-
-
-def _window_size() -> int:
-    # Includes the [CLS] and [SEP] special tokens, so usable text is 2 fewer.
-    return int(_get_model().max_seq_length)
-
-
-def _rank_of_first_expected(ranking: list[ScoredArticle], expected: tuple[str, ...]) -> int | None:
-    for position, scored in enumerate(ranking, start=1):
-        if scored.article.id in expected:
-            return position
+def _article_rank(ranking: list[ScoredChunk], expected: tuple[str, ...]) -> int | None:
+    # Articles in order of their best chunk: the first time each article
+    # shows up in the chunk ranking is its position.
+    articles_seen: list[str] = []
+    for scored in ranking:
+        if scored.chunk.article_id not in articles_seen:
+            articles_seen.append(scored.chunk.article_id)
+            if scored.chunk.article_id in expected:
+                return len(articles_seen)
     return None
+
+
+def _answer_returned(chunks: list[ScoredChunk], q: EvalQuery) -> bool:
+    return q.evidence is not None and any(
+        s.chunk.article_id in q.expected and q.evidence in s.chunk.text for s in chunks
+    )
+
+
+def _returned(ranking: list[ScoredChunk], cutoff: float) -> list[ScoredChunk]:
+    # What the tool hands the agent: the top-k chunks, minus any below the cutoff.
+    return [s for s in ranking[:_TOP_K] if s.similarity >= cutoff]
 
 
 def _pct(numerator: int, denominator: int) -> str:
@@ -94,81 +101,83 @@ def _pct(numerator: int, denominator: int) -> str:
 
 
 def main() -> None:
-    articles = {article.id: article for article in load_articles()}
+    chunks = get_chunks()
     queries = load_queries()
-    window = _window_size()
-    rankings = {q.query: rank_articles(q.query, k=len(articles)) for q in queries}
+    rankings = {q.query: search_chunks(q.query, k=len(chunks)) for q in queries}
 
     # --- Corpus -----------------------------------------------------------
-    tokenizer = _get_model().tokenizer
-    article_tokens = {
-        article.id: len(tokenizer(article.body, add_special_tokens=False, verbose=False)["input_ids"])
-        for article in articles.values()
-    }
-    truncated = sum(1 for tokens in article_tokens.values() if tokens > window - 2)
-    print(f"Corpus: {len(articles)} articles, model window {window} tokens")
+    chunk_tokens = [count_tokens(c.embedding_text) for c in chunks]
+    truncated = sum(1 for tokens in chunk_tokens if tokens > _MODEL_WINDOW - 2)
+    articles = len({c.article_id for c in chunks})
+    print(f"Corpus: {articles} articles -> {len(chunks)} chunks")
     print(
-        f"  article length {min(article_tokens.values())}-{max(article_tokens.values())} tokens; "
-        f"{truncated}/{len(articles)} truncated when embedded\n"
+        f"  chunk length {min(chunk_tokens)}-{max(chunk_tokens)} tokens embedded; "
+        f"{truncated}/{len(chunks)} truncated by the {_MODEL_WINDOW}-token window"
     )
+    # A quote split across two chunks can never be "returned" whole, which
+    # would wrongly count as a retrieval miss — flag it rather than hide it.
+    split = [
+        q.query
+        for q in queries
+        if q.evidence is not None
+        and not any(c.article_id == q.expected[0] and q.evidence in c.text for c in chunks)
+    ]
+    print(f"  evidence quotes split across chunks: {len(split)}" + (f" {split}" if split else ""))
+    print()
 
     # --- 1. Ranking quality -------------------------------------------------
     answerable = [q for q in queries if q.expected]
     groups: dict[str, list[EvalQuery]] = {"all answerable": answerable}
     for category in ("paraphrase", "identifier"):
         groups[category] = [q for q in answerable if q.category == category]
-    in_window: list[EvalQuery] = []
-    past_window: list[EvalQuery] = []
-    for q in answerable:
-        assert q.evidence is not None
-        offset = evidence_token_offset(articles[q.expected[0]], q.evidence)
-        (in_window if offset < window - 1 else past_window).append(q)
-    groups["evidence inside window"] = in_window
-    groups["evidence past window"] = past_window
 
-    print("Ranking quality (no threshold)")
-    print(f"  {'group':<24}{'n':>4}{'hit@1':>9}{'hit@3':>9}{'MRR':>8}")
+    print(f"Ranking quality (no threshold; 'answer@{_TOP_K}' = answer text in the top {_TOP_K} chunks)")
+    print(f"  {'group':<18}{'n':>4}{'hit@1':>9}{'hit@3':>9}{'MRR':>8}{f'answer@{_TOP_K}':>11}")
     for name, group in groups.items():
-        ranks = [_rank_of_first_expected(rankings[q.query], q.expected) for q in group]
+        ranks = [_article_rank(rankings[q.query], q.expected) for q in group]
         hit1 = sum(1 for r in ranks if r is not None and r <= 1)
         hit3 = sum(1 for r in ranks if r is not None and r <= 3)
         mrr = sum(1 / r for r in ranks if r is not None) / len(ranks) if ranks else 0.0
-        print(f"  {name:<24}{len(group):>4}{_pct(hit1, len(group)):>9}{_pct(hit3, len(group)):>9}{mrr:>8.3f}")
+        answered = sum(1 for q in group if _answer_returned(rankings[q.query][:_TOP_K], q))
+        print(
+            f"  {name:<18}{len(group):>4}{_pct(hit1, len(group)):>9}{_pct(hit3, len(group)):>9}"
+            f"{mrr:>8.3f}{_pct(answered, len(group)):>11}"
+        )
+    returned_tokens = [
+        sum(count_tokens(s.chunk.text) for s in _returned(rankings[q.query], _RELEVANCE_THRESHOLD))
+        for q in answerable
+    ]
+    print(
+        f"  avg text returned per answerable query at the current cutoff: "
+        f"{sum(returned_tokens) / len(returned_tokens):.0f} tokens"
+    )
 
     # --- 2. Threshold sweep ---------------------------------------------------
     unrelated = [q for q in queries if not q.expected]
-    print(f"\nThreshold sweep (top {_TOP_K}, as the tool returns them)")
-    print(f"  {'cutoff':<10}{'answer recall':>15}{'unrelated rejected':>20}")
+    print(f"\nThreshold sweep (top {_TOP_K} chunks, as the tool returns them)")
+    print(f"  {'cutoff':<10}{'answer returned':>17}{'unrelated rejected':>20}")
     for step in range(20, 65, 5):
         cutoff = step / 100
-        recalled = 0
-        for q in answerable:
-            returned = [s for s in rankings[q.query][:_TOP_K] if s.similarity >= cutoff]
-            recalled += any(s.article.id in q.expected for s in returned)
-        rejected = sum(1 for q in unrelated if rankings[q.query][0].similarity < cutoff)
+        answered = sum(1 for q in answerable if _answer_returned(_returned(rankings[q.query], cutoff), q))
+        rejected = sum(1 for q in unrelated if not _returned(rankings[q.query], cutoff))
         marker = "  <- current" if abs(cutoff - _RELEVANCE_THRESHOLD) < 1e-9 else ""
         print(
-            f"  {cutoff:<10.2f}{_pct(recalled, len(answerable)):>15}"
+            f"  {cutoff:<10.2f}{_pct(answered, len(answerable)):>17}"
             f"{_pct(rejected, len(unrelated)):>20}{marker}"
         )
 
     # --- 3. Failures at the current configuration -------------------------
     print(f"\nFailures at the current cutoff ({_RELEVANCE_THRESHOLD})")
     for q in queries:
-        top = rankings[q.query][:_TOP_K]
-        returned = [s for s in top if s.similarity >= _RELEVANCE_THRESHOLD]
-        correct = (
-            any(s.article.id in q.expected for s in returned) if q.expected else not returned
-        )
+        returned = _returned(rankings[q.query], _RELEVANCE_THRESHOLD)
+        correct = _answer_returned(returned, q) if q.expected else not returned
         if correct:
             continue
-        where = ""
-        if q.expected and q.evidence is not None:
-            where = " [evidence past window]" if q in past_window else " [evidence inside window]"
         wanted = ", ".join(q.expected) or "nothing"
-        print(f'  "{q.query}" ({q.category}) wanted: {wanted}{where}')
-        for s in top:
-            print(f"      {s.similarity:.3f}  {s.article.id}")
+        print(f'  "{q.query}" ({q.category}) wanted: {wanted}')
+        for s in rankings[q.query][:3]:
+            has_answer = " <- has answer" if _answer_returned([s], q) else ""
+            print(f"      {s.similarity:.3f}  {s.chunk.id} ({s.chunk.context}){has_answer}")
 
 
 if __name__ == "__main__":

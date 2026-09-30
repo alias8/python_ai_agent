@@ -61,9 +61,11 @@ That's the entire loop. `create_agent()` (from the `langchain` package, matching
 
 `langchain/knowledge_base.py` replaced the project's original literal keyword match with real retrieval:
 
-1. The knowledge base is 17 realistic help-center articles (`langchain/kb_articles/`, one Markdown file each, ~400 words / 465-580 tokens). Each is embedded once with a local `sentence-transformers` model (`all-MiniLM-L6-v2`, 384-dim, no API key — runs in-process) and stored in an in-memory ChromaDB collection.
-2. A query is embedded the same way and matched against the collection by cosine similarity, not word overlap.
-3. The tool returns at most the top 3 articles, and only those above a relevance cutoff (`_RELEVANCE_THRESHOLD = 0.35`) — so when nothing is actually relevant it says so, rather than confidently citing the "least-bad" article.
+1. The knowledge base is 17 realistic help-center articles (`langchain/kb_articles/`, one Markdown file each, ~400 words / 465-580 tokens).
+2. Each article is split into chunks along its own `##` sections (`langchain/chunking.py`) — 109 chunks of 25-195 tokens, each small enough that the embedding model reads all of it.
+3. Each chunk is embedded, with its article title and section heading prefixed, by a local `sentence-transformers` model (`all-MiniLM-L6-v2`, 384-dim, no API key — runs in-process) and stored in an in-memory ChromaDB collection.
+4. A query is embedded the same way and matched against the chunks by cosine similarity, not word overlap.
+5. The tool returns at most the top 5 chunks, each under its article and section heading, and only those above a relevance cutoff (`_RELEVANCE_THRESHOLD = 0.40`) — so when nothing is actually relevant it says so, rather than confidently citing the "least-bad" match.
 
 The original motivating comparison, made when the knowledge base was three one-sentence articles: querying **"how do I send something back"** (zero words in common with the article that answers it), the keyword version returned **all three** articles — splitting the query into words includes the single-letter term `"i"`, which substring-matched every article — while semantic search returned just the return policy.
 
@@ -71,23 +73,28 @@ The original motivating comparison, made when the knowledge base was three one-s
 
 With a realistic corpus, "try a couple of queries and eyeball it" stops working, so retrieval is scored against a labeled set: `evals/kb_eval_queries.json` has 54 queries — 38 natural-language paraphrases, 7 exact-identifier queries (payment error codes like `E-4020`, plan names), and 9 unrelated ones that should return nothing, including near-misses like "how do I return a rental car". Each answerable query names the article(s) that answer it and quotes the exact evidence sentence; `tests/test_kb_eval_data.py` checks every label points at a real article and a real quote.
 
-Baseline (one vector per whole article, 0.35 cutoff):
+Two metrics matter. **hit@k / MRR** ask whether the right *article* ranks near the top. **answer returned** is stricter: does the text the tool actually hands the agent contain the answer sentence? The right article with the wrong section still leaves the agent unable to answer.
 
-| | n | hit@1 | hit@3 | MRR |
-| --- | --- | --- | --- | --- |
-| all answerable | 45 | 73.3% | 93.3% | 0.827 |
-| paraphrase | 38 | 78.9% | 97.4% | 0.871 |
-| identifier | 7 | 42.9% | 71.4% | 0.592 |
-| evidence inside the 256-token window | 20 | 80.0% | 100.0% | 0.883 |
-| evidence past the window | 25 | 68.0% | 88.0% | 0.782 |
+| | baseline: whole articles | chunked by section |
+| --- | --- | --- |
+| hit@1 (all 45 answerable) | 73.3% | **88.9%** |
+| hit@3 | 93.3% | **95.6%** |
+| MRR | 0.827 | **0.930** |
+| hit@1, identifier queries (7) | 42.9% | **100.0%** |
+| articles/chunks truncated when embedded | 17 of 17 | **0 of 109** |
+| cutoff | 0.35 | 0.40 |
+| answer returned at that cutoff | 64.4% | **80.0%** |
+| unrelated queries rejected | 88.9% | 88.9% |
+| avg text returned to the agent | ~1,600 tokens (3 whole articles) | **~300 tokens** |
 
-What it shows:
+What it showed, in order:
 
-- **Every article is truncated.** `all-MiniLM-L6-v2` embeds only the first 256 tokens and silently drops the rest, so roughly half of each article is never embedded. Queries answered past the cutoff do measurably worse — they only succeed because the article's opening happens to be on-topic. This is what chunking fixes.
-- **Exact identifiers are the weak spot.** Error codes like `E-6002` are near-meaningless to an embedding model (hit@1 43%); this is what hybrid keyword + vector search fixes.
-- **The 0.35 cutoff no longer fits.** It was tuned on one-sentence articles; long-article vectors are diluted, so real matches score lower. At 0.35 only 64% of answerable queries get their answer back (vs 93% in the top 3 with no cutoff), while rejecting 89% of unrelated ones. A threshold is specific to a model *and* a corpus — it has to be re-tuned whenever either changes, which is why it isn't re-tuned until after chunking.
+- **Every article was truncated.** `all-MiniLM-L6-v2` embeds only the first 256 tokens and silently drops the rest, so roughly half of each ~500-token article was never embedded. Queries whose answer sat past that point did measurably worse (hit@1 68% vs 80%).
+- **Chunking by section beat fixed-size windows.** Three strategies were compared before building one: fixed 128-token windows with overlap, `##` sections, and sections with the article title + heading prefixed for embedding. The prefixed sections won on hit@1, MRR, and answer recall while returning the least text (fixed windows edged it on hit@3, 97.8% vs 95.6%) — a section like "Electronics can be returned within the same 30-day window..." doesn't say on its own that it's the restocking-fee policy; the prefix does. It also fixed identifier queries without hybrid search: error codes are in the section headings (`E-4020: Address verification failed`), so they're now in the embedded text of exactly the right chunk. That's 7 queries, though — too few to call hybrid search unnecessary.
+- **The cutoff had to be re-tuned, twice.** 0.35 was tuned on the original one-sentence articles; on whole long articles it dropped a third of answerable queries, because a 500-token vector is diluted and scores lower against everything. After chunking the sweep favoured 0.40: 0.45 rejects all 9 unrelated queries but drops answer recall to 69%, and the agent can ignore a loosely related chunk but can't answer from one it never received. A threshold belongs to a model *and* a corpus *and* a chunking scheme. It's also tuned on the same 54 queries it's measured on, so the numbers are optimistic until the set is big enough for a held-out split.
+- **Chunking isn't free.** "how do I send something back" regressed: short chunks like "Returned to sender" and "send the original item back" (exchanges) now out-rank the returns article's "How to start a return", which lands 6th. Other remaining misses are the same shape — the right article, but the answer in a lower-scoring section ("the vase arrived smashed" ranks "What happens to the damaged item" above "Report the problem within 7 days"). A cross-encoder reranker over the top ~20 chunks is the usual fix.
 
-Retrieval roadmap, each step measured against this eval: chunking → pgvector (with milestone 2's Postgres) → hybrid search via Postgres full-text + vector ranking → tenant filtering. Order lookups get server-side authorization separately — per-customer order data is a database query scoped to the authenticated customer, not something to put in a vector index.
+Retrieval roadmap, each step measured against this eval: ~~chunking~~ (done) → pgvector (with milestone 2's Postgres) → hybrid search via Postgres full-text + vector ranking → tenant filtering. Order lookups get server-side authorization separately — per-customer order data is a database query scoped to the authenticated customer, not something to put in a vector index.
 
 ## What happens on a tool failure (tested, not assumed)
 
