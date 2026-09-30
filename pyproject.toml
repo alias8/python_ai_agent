@@ -15,6 +15,7 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "pgvector>=0.3",
     "alembic>=1.13",
+    "pyjwt>=2.9",
     # langchain/knowledge_base.py's semantic search — local embeddings (sentence-transformers).
     #
     # Pinned versions below are load-bearing, not arbitrary: on an Intel Mac, PyPI only ships torch

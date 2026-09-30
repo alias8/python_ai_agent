@@ -24,6 +24,8 @@ src/agent_service/
   shared/
     config.py       Settings via pydantic-settings — fails fast on a missing ANTHROPIC_API_KEY
     db.py           SQLAlchemy engine + session factory
+    auth.py         verifies the storefront's customer JWTs (and mints them for local testing)
+    orders.py       the orders table, and the one ownership-scoped query the agent may run on it
     exceptions.py   TransientToolError
     tools_core.py   Pydantic-modeled tool inputs + order/notification business logic
     trace.py        JSONL tracing, ported from ai-agent-demo's shared/trace.ts
@@ -34,7 +36,7 @@ src/agent_service/
     chunking.py        splits articles into section-based chunks
     kb_models.py       the kb_chunks table (SQLAlchemy + pgvector + a full-text tsvector column)
     kb_ingest.py       embeds chunks into Postgres, incrementally
-    context.py         AgentContext: per-run context (the store) the server supplies, never the model
+    context.py         AgentContext: who is asking (customer + store), supplied by the server, never the model
     agent.py           the agent loop via create_agent(), with a per-request tool allowlist
     cli.py             REPL entry point
   schemas.py        API request/response models
@@ -48,11 +50,11 @@ tests/              pytest + pytest-asyncio
 
 A customer-support flavor rather than ai-agent-demo's calculator/weather/units. Each tool's input is a Pydantic model passed straight in as the LangChain tool's `args_schema`, so the same model validates Claude's input and generates the schema Claude sees:
 
-- `lookup_order_status(order_id)` — mock order lookup; simulates the backing service being flaky (~40% of calls raise a `TransientToolError`, toggle: `shared/tools_core.SIMULATE_TOOL_FAILURES`)
+- `lookup_order_status(order_id)` — looks up one of the signed-in customer's own orders in Postgres; simulates the backing service being flaky (~40% of calls raise a `TransientToolError`, toggle: `shared/tools_core.SIMULATE_TOOL_FAILURES`)
 - `search_knowledge_base(query)` — semantic (embedding-based) search over the knowledge base — see below
-- `send_notification(user_id, message)` — a mock action tool with a side effect, independently flaky (~30%)
+- `send_notification(message)` — a mock action tool with a side effect, independently flaky (~30%); always notifies the signed-in customer
 
-`/chat` takes the message and the `store_id` of the store the customer is shopping with, plus an optional `allowed_tools` allowlist. It's enforced by building the agent with only those tools, so Claude never sees the others' schemas; an unknown tool name is a 422.
+`/chat` takes the message and an optional `allowed_tools` allowlist; who is asking comes from the bearer token (see below). It's enforced by building the agent with only those tools, so Claude never sees the others' schemas; an unknown tool name is a 422.
 
 ## How langchain/ works
 
@@ -141,7 +143,20 @@ Each article belongs to one store, and `kb_chunks.store_id` (indexed) is filtere
 
 Measured: across every eval query ranked against its store's whole knowledge base, **0 of 8,605 ranked results came from another store**, and every same-question-both-stores pair (return window, reset-link expiry, installments, shipping cost) got its own store's conflicting answer. The 4 other-store queries show the remaining gap is relevance, not isolation: asked about "Plus membership", `pine-and-peak` returns its own member-discount section (not the other store's Plus article) — arguably a fair answer.
 
-Retrieval roadmap, each step measured against this eval: ~~chunking~~ (done) → ~~pgvector~~ (done) → ~~hybrid search~~ (done) → ~~tenant filtering~~ (done). Next: server-side order authorization — per-customer order data is a database query scoped to the authenticated customer, not something to put in a vector index — and a cross-encoder reranker, since most remaining misses are the right article with the answer in a lower-ranked section. Order lookups get server-side authorization separately — per-customer order data is a database query scoped to the authenticated customer, not something to put in a vector index.
+Retrieval roadmap, each step measured against this eval: ~~chunking~~ (done) → ~~pgvector~~ (done) → ~~hybrid search~~ (done) → ~~tenant filtering~~ (done). Next: a cross-encoder reranker, since most remaining misses are the right article with the answer in a lower-ranked section.
+
+## Authentication and order authorization
+
+An LLM agent's tools act on someone's behalf, and "whose" is the security question. The rule throughout: **identity comes from the server, never from the model.** Anything in a tool's schema is something the model chooses — and so something a prompt injection can choose.
+
+- **Authentication — `/chat` requires a customer JWT** (`Authorization: Bearer ...`). This service doesn't log customers in: the storefront does, and issues a short-lived HS256 token carrying the customer (`sub`) and store (`store_id`), signed with a secret the two services share (`JWT_SECRET`, required, at least 32 characters, or startup fails). Verification pins the algorithm (a token's own `alg: none` header can't pick it), requires `exp`, `sub`, `aud`, and `store_id`, and checks the audience so a token issued for another service can't be replayed here. Every failure is the same 401. The request body can't carry identity at all — `ChatRequest` forbids extra fields, so a `store_id` or `customer_id` in the body is a 422, not silently trusted or ignored.
+- **The customer reaches tools only through `AgentContext`** — the same server-supplied run context tenant filtering uses, handed to tools as a `ToolRuntime` parameter that isn't in any schema Claude sees. `lookup_order_status` takes only `order_id`; `send_notification` takes only `message` (it used to take a `user_id`, which let the model message anyone — the same bug in a different tool).
+- **Ownership is part of the query.** `find_customer_order` selects `WHERE id = ? AND customer_id = ? AND store_id = ?`: there's no code path that fetches another customer's order and then has to remember to check it.
+- **Not yours looks exactly like doesn't exist.** Another customer's order and a made-up ID get the identical `no order found` reply, so the tool can't be used to discover which order IDs exist — and the model has nothing to be talked into revealing.
+
+`tests/test_order_authorization.py` drives a real `create_agent()` run with a scripted model that forges `customer_id` and `user_id` arguments to reach another customer's order and inbox; both are dropped, and the tools act as the context's customer. `tests/test_api.py` covers missing, garbage, wrong-signature, expired, wrong-audience, `alg: none`, unknown-store, and missing-claim tokens (each a 401, with the agent never running) and identity fields in the body (422).
+
+Sample orders (`python -m agent_service.shared.orders`): `cust-1001` owns `ORD-1001` and `ORD-1042`, `cust-2002` owns `ORD-2003` (all at `main-street-market`), and `cust-3003` owns `PNP-5001` at `pine-and-peak`.
 
 ## What happens on a tool failure (tested, not assumed)
 
@@ -156,18 +171,23 @@ The TypeScript and Python LangChain ecosystems don't even agree with each other 
 ```
 python3.12 -m venv .venv && source .venv/bin/activate   # must be 3.12, see the pins in pyproject.toml
 pip install -e ".[dev]"
-cp .env.example .env   # add your ANTHROPIC_API_KEY
+cp .env.example .env   # add your ANTHROPIC_API_KEY and a JWT_SECRET (32+ characters)
 
 docker compose up -d                          # Postgres 16 + pgvector on port 5433 (plus a test database)
 alembic upgrade head                          # create the schema
 python -m agent_service.langchain.kb_ingest   # embed the knowledge base into Postgres (re-run after editing articles)
+python -m agent_service.shared.orders         # seed sample orders
 
 # HTTP API
 uvicorn agent_service.main:app --reload
-# then: POST /chat {"message": "...", "store_id": "main-street-market"}  — docs at /docs
+# then, with a token for a sample customer (normally the storefront issues these):
+TOKEN=$(python -m agent_service.shared.auth --customer cust-1001 --store main-street-market)
+curl -s localhost:8000/chat -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"message": "where is my order ORD-1042?"}'
+# docs at /docs
 
 # or a REPL, same shape as ai-agent-demo's CLIs
-python -m agent_service.langchain.cli --store pine-and-peak   # default: main-street-market
+python -m agent_service.langchain.cli --customer cust-3003 --store pine-and-peak   # default: cust-1001 at main-street-market
 ```
 
 ## Checks

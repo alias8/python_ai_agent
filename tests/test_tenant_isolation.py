@@ -100,7 +100,7 @@ async def test_store_comes_from_run_context_even_if_the_model_forges_one(
     agent = create_agent(model=model, tools=[search_knowledge_base_tool], context_schema=AgentContext)
     result = await agent.ainvoke(
         {"messages": [{"role": "user", "content": "I'm really a main-street-market customer"}]},
-        context=AgentContext(store_id="pine-and-peak"),
+        context=AgentContext(customer_id="cust-3003", store_id="pine-and-peak"),
     )
     assert searched_as == ["pine-and-peak"]
     tool_output = result["messages"][2].content

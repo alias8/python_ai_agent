@@ -83,8 +83,19 @@ def _traced(name: str, model: type[Any], func: Callable[[Any, AgentContext], str
 lookup_order_status_tool: BaseTool = tool(
     "lookup_order_status",
     args_schema=LookupOrderStatusInput,
-    description="Look up the current status of a customer order by its order ID.",
-)(_traced("lookup_order_status", LookupOrderStatusInput, lambda input, _context: lookup_order_status(input)))
+    description=(
+        "Look up the current status of one of the customer's own orders by its order ID. "
+        "Only the signed-in customer's orders can be found."
+    ),
+)(
+    _traced(
+        "lookup_order_status",
+        LookupOrderStatusInput,
+        lambda input, context: lookup_order_status(
+            input, customer_id=context.customer_id, store_id=context.store_id
+        ),
+    )
+)
 
 search_knowledge_base_tool: BaseTool = tool(
     "search_knowledge_base",
@@ -105,8 +116,14 @@ search_knowledge_base_tool: BaseTool = tool(
 send_notification_tool: BaseTool = tool(
     "send_notification",
     args_schema=SendNotificationInput,
-    description="Send a notification message to a user, e.g. to tell them about their order.",
-)(_traced("send_notification", SendNotificationInput, lambda input, _context: send_notification(input)))
+    description="Send a notification message to the customer, e.g. to tell them about their order.",
+)(
+    _traced(
+        "send_notification",
+        SendNotificationInput,
+        lambda input, context: send_notification(input, customer_id=context.customer_id),
+    )
+)
 
 LANGCHAIN_TOOLS: list[BaseTool] = [
     lookup_order_status_tool,

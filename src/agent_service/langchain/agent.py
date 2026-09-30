@@ -36,6 +36,8 @@ SYSTEM_PROMPT = (
     "Use tools whenever they would help answer the user's question accurately, and chain "
     "multiple tool calls together when a question requires more than one step (for example, "
     "looking up an order and then notifying the customer about it).\n"
+    "You can only see the signed-in customer's own orders. If an order isn't found, say so; "
+    "don't speculate about whether it exists or who it belongs to.\n"
     "When you are done, give a clear, concise final answer."
 )
 
@@ -89,13 +91,13 @@ def _message_text(message: BaseMessage) -> str:
 
 async def run_agent(
     user_message: str,
-    store_id: str,
+    context: AgentContext,
     on_step: OnStep | None = None,
     allowed_tools: Sequence[str] | None = None,
 ) -> str:
-    """store_id scopes the run to one store (tenant). It's the caller's job
-    to establish it — from the authenticated request, never from the user's
-    message — and it reaches tools only through AgentContext."""
+    """context says who is asking (customer and store). It's the caller's
+    job to establish it — from the authenticated request, never from the
+    user's message — and it reaches tools only through ToolRuntime."""
     agent = _get_agent(select_tools(allowed_tools))
     reset_call_sequence()
 
@@ -103,7 +105,7 @@ async def run_agent(
         result = await agent.ainvoke(
             {"messages": [{"role": "user", "content": user_message}]},
             {"recursion_limit": RECURSION_LIMIT},
-            context=AgentContext(store_id=store_id),
+            context=context,
         )
     except GraphRecursionError:
         # The loop never produced a final answer within RECURSION_LIMIT

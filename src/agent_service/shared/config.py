@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +18,15 @@ class Settings(BaseSettings):
     claude_model: str = "claude-sonnet-5"
     # Matches docker-compose.yml's local Postgres (port 5433, not 5432).
     database_url: str = "postgresql+psycopg://agent:agent@localhost:5433/agent_service"
+    # Shared secret for verifying the customer JWTs the storefront issues
+    # (HS256). Required, no default: a missing secret must fail at startup,
+    # not fall back to something guessable. 32+ characters, the minimum
+    # RFC 7518 recommends for an HS256 key — a short one fails here too,
+    # rather than quietly weakening every token.
+    jwt_secret: str = Field(min_length=32)
+    # The `aud` claim a token must carry — so a token the storefront issued
+    # for some other service can't be replayed against this one.
+    jwt_audience: str = "agent-service"
 
 
 @lru_cache

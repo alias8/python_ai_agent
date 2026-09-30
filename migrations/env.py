@@ -6,6 +6,7 @@ from alembic import context
 from sqlalchemy import create_engine
 
 from agent_service.langchain import kb_models  # noqa: F401  (registers kb_chunks on Base.metadata)
+from agent_service.shared import orders  # noqa: F401  (registers orders on Base.metadata)
 from agent_service.shared.config import get_settings
 from agent_service.shared.db import Base
 
