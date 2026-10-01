@@ -48,13 +48,32 @@ def test_lookup_order_status_transient_failure(monkeypatch: pytest.MonkeyPatch) 
         _lookup("ORD-1042")
 
 
-def test_send_notification_goes_to_the_given_customer(no_simulated_failures: None) -> None:
+def _notify(key: str) -> str:
     message = tools_core.SendNotificationInput(message="hi")
-    result = tools_core.send_notification(message, customer_id="cust-1001")
-    assert result == 'Notification sent to cust-1001: "hi"'
+    return tools_core.send_notification(message, customer_id="cust-1001", idempotency_key=key)
 
 
-def test_send_notification_transient_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+def _delivered(key: str) -> int:
+    return sum(1 for k, _, _ in tools_core.deliveries() if k == key)
+
+
+def test_send_notification_goes_to_the_given_customer(no_simulated_failures: None) -> None:
+    assert _notify("key-success") == 'Notification sent to cust-1001: "hi"'
+    assert _delivered("key-success") == 1
+
+
+def test_send_notification_failure_before_sending_delivers_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("agent_service.shared.tools_core.random.random", lambda: 0.1)
-    with pytest.raises(TransientToolError):
-        tools_core.send_notification(tools_core.SendNotificationInput(message="hi"), customer_id="cust-1001")
+    with pytest.raises(TransientToolError, match="unavailable"):
+        _notify("key-before")
+    assert _delivered("key-before") == 0
+
+
+def test_send_notification_same_key_is_delivered_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Delivered, but the confirmation is lost; a retry with the same key
+    # reports success without delivering again.
+    monkeypatch.setattr("agent_service.shared.tools_core.random.random", lambda: 0.2)
+    with pytest.raises(TransientToolError, match="confirmation"):
+        _notify("key-ambiguous")
+    assert _notify("key-ambiguous") == 'Notification sent to cust-1001: "hi"'
+    assert _delivered("key-ambiguous") == 1

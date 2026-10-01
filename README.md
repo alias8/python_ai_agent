@@ -52,7 +52,7 @@ A customer-support flavor rather than ai-agent-demo's calculator/weather/units. 
 
 - `lookup_order_status(order_id)` — looks up one of the signed-in customer's own orders in Postgres; simulates the backing service being flaky (~40% of calls raise a `TransientToolError`, toggle: `shared/tools_core.SIMULATE_TOOL_FAILURES`)
 - `search_knowledge_base(query)` — semantic (embedding-based) search over the knowledge base — see below
-- `send_notification(message)` — a mock action tool with a side effect, independently flaky (~30%); always notifies the signed-in customer
+- `send_notification(message)` — a mock action tool with a side effect, independently flaky (~30%); always notifies the signed-in customer, and delivers at most once per tool call (idempotency key) however often it's retried
 
 `/chat` takes the message and an optional `allowed_tools` allowlist; who is asking comes from the bearer token (see below). It's enforced by building the agent with only those tools, so Claude never sees the others' schemas; an unknown tool name is a 422.
 
@@ -160,11 +160,19 @@ Sample orders (`python -m agent_service.shared.orders`): `cust-1001` owns `ORD-1
 
 ## What happens on a tool failure (tested, not assumed)
 
-`lookup_order_status`'s simulated ~40% failure rate turned out to be a good way to observe LangChain's default behavior rather than guess at it from docs — and it's the opposite of `ai-agent-demo`'s TypeScript finding. LangChain.js's `ToolNode` catches a thrown error by default and turns it into an error `ToolMessage`, no crash. LangGraph's *Python* `ToolNode` does not: its default `handle_tool_errors` handler (`langgraph.prebuilt.tool_node._default_handle_tool_errors`) only catches its own `ToolInvocationError` (malformed tool-call arguments) — any exception raised from inside the tool itself, `TransientToolError` included, propagates straight up through `agent.ainvoke()` and crashes the whole run. Confirmed by driving `create_agent()` with a scripted fake chat model (no network) and watching a raised `TransientToolError` blow past the graph instead of becoming a message. `create_agent()` builds its `ToolNode` without overriding this, so it inherits the crash-by-default behavior. Opting into "don't crash" means passing `handle_tool_errors=True` (or a handler) directly to a `ToolNode` — not exposed as a `create_agent()` parameter.
+`lookup_order_status` and `send_notification` simulate flaky backing services (~40% and ~30% of calls raise `TransientToolError`; toggle: `shared/tools_core.SIMULATE_TOOL_FAILURES`).
 
-The TypeScript and Python LangChain ecosystems don't even agree with each other on what "the default" is for the exact same framework concept.
+**LangGraph's Python default is to crash the run.** It's the opposite of `ai-agent-demo`'s TypeScript finding: LangChain.js's `ToolNode` catches a thrown error by default and turns it into an error `ToolMessage`. LangGraph's *Python* `ToolNode` does not — its default `handle_tool_errors` (`langgraph.prebuilt.tool_node._default_handle_tool_errors`) only catches its own `ToolInvocationError` (malformed arguments), so any exception raised inside a tool propagates through `agent.ainvoke()` and ends the run. Confirmed with a scripted fake model, not assumed from docs. Left like that, `/chat` returned a 500 on roughly 40% of order lookups.
 
-**Consequence today:** nothing retries or catches tool errors, so with `SIMULATE_TOOL_FAILURES` on, a `/chat` request that calls `lookup_order_status` fails with a 500 roughly 40% of the time.
+**The fix is LangChain 1.x's agent middleware** (`create_agent(middleware=...)` in `langchain/agent.py`), not hand-rolled retry loops:
+
+- **`ToolRetryMiddleware`** retries only `TransientToolError` — 2 retries, exponential backoff with jitter (0.5s, 1s, capped at 4s) — which takes a 40% per-call failure rate to ~6% (0.4³). When retries run out, the model gets a plain "temporarily unavailable, suggest trying again shortly" message to relay.
+- **`ToolErrorMiddleware`**, wrapped around the retries, catches everything else — a bug, the database being down — and gives the model only the exception's *type*. Its message can carry internal detail (a SQL statement, a connection string); the full error is in the JSONL trace instead. These aren't retried.
+- **Retrying a side effect needs an idempotency key.** The dangerous failure is the ambiguous one: the notification went out, but the confirmation never came back. A blind retry notifies the customer twice. `send_notification` takes an idempotency key — the tool call's own ID (`ToolRuntime.tool_call_id`), which stays the same across retries of that call — and the (mock) service answers an already-delivered key with success instead of sending again. The mock now fails both ways: before sending, and after sending but before confirming.
+
+`tests/test_tool_failures.py` drives the real `run_agent` with a scripted model: failures retried until success; retries exhausted → a message, not an exception; an unexpected error → its type only (a planted password in the message never reaches the model), never retried; a lost confirmation → retried, delivered exactly once; and `/chat` returning 200 with the order service permanently down.
+
+The TypeScript and Python LangChain ecosystems don't agree on what "the default" is for the same framework concept — worth knowing before trusting either one's defaults in production.
 
 ## Running it
 

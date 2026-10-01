@@ -6,8 +6,11 @@ calls" condition are all built into create_agent()'s underlying LangGraph
 state machine — the framework tradeoff: much less code to write, but the
 loop mechanics are no longer something you can point at and read.
 
-No retry/backoff is added around tools — see the project README for what
-LangChain does by default when a tool raises.
+Tool failures go through LangChain's middleware (tool_middleware below):
+transient ones are retried with backoff, and anything that still fails is
+handed to the model as an error message, so a flaky or broken tool never
+crashes the run — which by default, in LangGraph's Python ToolNode, it
+would. See the README.
 """
 
 from collections.abc import Callable, Sequence
@@ -15,12 +18,19 @@ from functools import lru_cache
 from typing import Any
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import (
+    AgentMiddleware,
+    ToolCallRequest,
+    ToolErrorMiddleware,
+    ToolRetryMiddleware,
+)
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
 from pydantic import SecretStr
 
 from ..shared.config import get_settings
+from ..shared.exceptions import TransientToolError
 from ..shared.trace import trace_api_error, trace_final_answer, trace_max_iterations
 from .context import AgentContext
 from .tools import LANGCHAIN_TOOLS, reset_call_sequence
@@ -51,6 +61,55 @@ _model = ChatAnthropic(
     max_tokens=1024,
 )
 
+# Retries after the first attempt, for a TransientToolError. With the mock
+# services' failure rates, 3 attempts in all turn a 40% per-call failure
+# into ~6% (0.4^3), and 30% into ~3%.
+TOOL_MAX_RETRIES = 2
+
+
+def _transient_failure_message(exc: Exception) -> str:
+    # What the model sees once retries are exhausted: enough to tell the
+    # customer something useful, without the exception's internal detail.
+    return (
+        "This service is temporarily unavailable and didn't respond after several attempts. "
+        "Tell the customer you couldn't complete this right now and suggest trying again shortly."
+    )
+
+
+def _unexpected_tool_error(exc: Exception, request: ToolCallRequest) -> str:
+    # Anything that isn't a TransientToolError: a bug, the database being
+    # down. Only the exception's type reaches the model — its message can
+    # carry internal detail (a SQL statement, a connection string). The full
+    # error is already in the JSONL trace, written by tools.py's wrapper.
+    return (
+        f"This tool failed unexpectedly ({type(exc).__name__}). "
+        "Tell the customer you couldn't complete this right now; don't retry it."
+    )
+
+
+def tool_middleware(initial_delay: float = 0.5) -> list[AgentMiddleware[Any, Any, Any]]:
+    """Retries transient tool failures, then turns every tool failure into a
+    message for the model instead of an exception that ends the run.
+
+    Order matters: the first middleware wraps the ones after it. The error
+    handler sits outside the retries, so it only sees what's left once
+    retrying has either succeeded, given up (and returned its own message),
+    or passed through an exception it doesn't retry.
+    """
+    return [
+        ToolErrorMiddleware(on_error=_unexpected_tool_error),
+        ToolRetryMiddleware(
+            max_retries=TOOL_MAX_RETRIES,
+            retry_on=(TransientToolError,),
+            on_failure=_transient_failure_message,
+            initial_delay=initial_delay,
+            backoff_factor=2.0,
+            max_delay=4.0,
+            jitter=True,
+        ),
+    ]
+
+
 _TOOLS_BY_NAME = {t.name: t for t in LANGCHAIN_TOOLS}
 
 
@@ -75,7 +134,11 @@ def _get_agent(tool_names: tuple[str, ...]) -> Any:
     # isn't free and the set of allowlists in practice is small.
     tools = [_TOOLS_BY_NAME[name] for name in tool_names]
     return create_agent(
-        model=_model, tools=tools, system_prompt=SYSTEM_PROMPT, context_schema=AgentContext
+        model=_model,
+        tools=tools,
+        system_prompt=SYSTEM_PROMPT,
+        context_schema=AgentContext,
+        middleware=tool_middleware(),
     )
 
 

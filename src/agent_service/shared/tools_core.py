@@ -64,11 +64,36 @@ def lookup_order_status(input: LookupOrderStatusInput, customer_id: str, store_i
     )
 
 
-def send_notification(input: SendNotificationInput, customer_id: str) -> str:
-    # A different flavor of flaky dependency than lookup_order_status: an
-    # action with a side effect, rather than a read. Retrying this one is
-    # only safe because the mock "notification service" is idempotent per
-    # call in this demo — a real one would need a dedupe key to retry safely.
-    if SIMULATE_TOOL_FAILURES and random.random() < 0.3:
-        raise TransientToolError(f'notification service temporarily unavailable for "{customer_id}"')
+# The mock notification service's delivery log. A real service keeps this
+# on its side; it's in-process here, and never trimmed, because it's a mock.
+_deliveries: list[tuple[str, str, str]] = []  # (idempotency key, customer, message)
+
+
+def deliveries() -> list[tuple[str, str, str]]:
+    return list(_deliveries)
+
+
+def send_notification(input: SendNotificationInput, customer_id: str, idempotency_key: str) -> str:
+    """Sends at most once per idempotency_key, however many times it's called.
+
+    A different flavor of flaky dependency than lookup_order_status: an
+    action with a side effect, which makes retrying it dangerous. The
+    failure that matters is the ambiguous one — the notification went out,
+    but the confirmation never came back — because the caller can't tell it
+    apart from a failure before sending. Retrying blindly would notify the
+    customer twice. So every call carries an idempotency key, which stays
+    the same across retries of one tool call, and a key already delivered is
+    answered with success instead of being sent again.
+    """
+    if any(key == idempotency_key for key, _, _ in _deliveries):
+        return f'Notification sent to {customer_id}: "{input.message}"'
+
+    roll = random.random()
+    if SIMULATE_TOOL_FAILURES and roll < 0.15:
+        # Failed before sending: nothing went out.
+        raise TransientToolError("notification service temporarily unavailable")
+    _deliveries.append((idempotency_key, customer_id, input.message))
+    if SIMULATE_TOOL_FAILURES and roll < 0.30:
+        # Sent, but the confirmation was lost — the dangerous case to retry.
+        raise TransientToolError("notification service timed out waiting for delivery confirmation")
     return f'Notification sent to {customer_id}: "{input.message}"'

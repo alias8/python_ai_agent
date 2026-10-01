@@ -3,6 +3,7 @@ customer the tools act for comes from the run's AgentContext, and nothing
 the model sends can change it."""
 
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from langchain.agents import create_agent
@@ -28,7 +29,10 @@ async def _run_tool_call(tool: BaseTool, args: dict[str, Any], context: AgentCon
     model = _ScriptedModel(
         messages=iter(
             [
-                AIMessage(content="", tool_calls=[{"name": tool.name, "args": args, "id": "call_1"}]),
+                AIMessage(
+                    content="",
+                    tool_calls=[{"name": tool.name, "args": args, "id": f"call_{uuid4().hex}"}],
+                ),
                 AIMessage(content="done"),
             ]
         )

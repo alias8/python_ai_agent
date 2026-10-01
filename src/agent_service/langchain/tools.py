@@ -35,12 +35,12 @@ def reset_call_sequence() -> None:
     _call_sequence = 0
 
 
-def _traced(name: str, model: type[Any], func: Callable[[Any, AgentContext], str]) -> Any:
+def _traced(name: str, model: type[Any], func: Callable[[Any, ToolRuntime[AgentContext]], str]) -> Any:
     # Wraps a tools_core function with a JSONL trace_tool_call entry. This
-    # does NOT retry or catch TransientToolError itself — it logs and
-    # re-raises, so LangGraph's own tool-error handling is what actually
-    # determines what happens next (see the README: by default, it crashes
-    # the run).
+    # doesn't retry or catch anything itself — it logs and re-raises. Retries
+    # and turning failures into messages for the model are the agent's
+    # middleware's job (agent.py), so each retry attempt shows up here as
+    # its own trace entry.
     #
     # `runtime` is filled in by LangChain from the run's AgentContext, not by
     # the model: it's excluded from the schema Claude sees, and any argument
@@ -53,7 +53,7 @@ def _traced(name: str, model: type[Any], func: Callable[[Any, AgentContext], str
 
         start = time.monotonic()
         try:
-            output = func(model(**kwargs), runtime.context)
+            output = func(model(**kwargs), runtime)
             trace_tool_call(
                 iteration=iteration,
                 tool=name,
@@ -91,8 +91,8 @@ lookup_order_status_tool: BaseTool = tool(
     _traced(
         "lookup_order_status",
         LookupOrderStatusInput,
-        lambda input, context: lookup_order_status(
-            input, customer_id=context.customer_id, store_id=context.store_id
+        lambda input, runtime: lookup_order_status(
+            input, customer_id=runtime.context.customer_id, store_id=runtime.context.store_id
         ),
     )
 )
@@ -109,7 +109,7 @@ search_knowledge_base_tool: BaseTool = tool(
     _traced(
         "search_knowledge_base",
         SearchKnowledgeBaseInput,
-        lambda input, context: search_knowledge_base_semantic(input, store_id=context.store_id),
+        lambda input, runtime: search_knowledge_base_semantic(input, store_id=runtime.context.store_id),
     )
 )
 
@@ -121,7 +121,11 @@ send_notification_tool: BaseTool = tool(
     _traced(
         "send_notification",
         SendNotificationInput,
-        lambda input, context: send_notification(input, customer_id=context.customer_id),
+        # The tool call's ID is the idempotency key: the retry middleware
+        # re-runs the same tool call, so every retry carries the same key.
+        lambda input, runtime: send_notification(
+            input, customer_id=runtime.context.customer_id, idempotency_key=str(runtime.tool_call_id)
+        ),
     )
 )
 
