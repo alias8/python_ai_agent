@@ -4,6 +4,8 @@ The Python/FastAPI sibling of [`ai-agent-demo`](../ai-agent-demo) — the same C
 
 The loop is built on LangChain's current `create_agent()` (`src/agent_service/langchain/`), served over FastAPI (`/chat`), with a production-style retrieval tool: embedding-based search over a realistic knowledge base, measured by a labeled eval.
 
+The frontend for it is a separate repo: https://github.com/alias8/ai-agent-demo-frontend, a React UI that shows each run's tool calls, retries and results.
+
 An earlier hand-rolled version built directly on the Anthropic SDK (`direct_api/`, with tenacity retries and loop detection) was removed once the side-by-side comparison had served its purpose; it's in the git history.
 
 ## Why this exists
@@ -195,7 +197,7 @@ curl -s localhost:8000/chat -H "Authorization: Bearer $TOKEN" -H 'Content-Type: 
 # the response carries the run's trace entries as well as the answer: one per tool-call attempt
 # docs at /docs
 
-# or a UI that lays that trace out per run: ../ai-agent-demo-frontend (npm install && npm run dev)
+# or a UI that lays that trace out per run: https://github.com/alias8/ai-agent-demo-frontend (npm install && npm run dev)
 
 # or a REPL, same shape as ai-agent-demo's CLIs
 python -m agent_service.langchain.cli --customer cust-3003 --store pine-and-peak   # default: cust-1001 at main-street-market
