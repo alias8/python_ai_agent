@@ -192,7 +192,10 @@ uvicorn agent_service.main:app --reload
 TOKEN=$(python -m agent_service.shared.auth --customer cust-1001 --store main-street-market)
 curl -s localhost:8000/chat -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"message": "where is my order ORD-1042?"}'
+# the response carries the run's trace entries as well as the answer: one per tool-call attempt
 # docs at /docs
+
+# or a UI that lays that trace out per run: ../ai-agent-demo-frontend (npm install && npm run dev)
 
 # or a REPL, same shape as ai-agent-demo's CLIs
 python -m agent_service.langchain.cli --customer cust-3003 --store pine-and-peak   # default: cust-1001 at main-street-market

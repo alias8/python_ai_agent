@@ -149,3 +149,47 @@ def test_chat_returns_200_when_the_order_service_is_down(
         )
     assert response.status_code == 200
     assert response.json()["answer"] == "done"
+
+
+def _chat_trace(message: str = "where is ORD-1042?") -> list[dict[str, Any]]:
+    with TestClient(app) as client:
+        response = client.post(
+            "/chat",
+            json={"message": message},
+            headers={"Authorization": f"Bearer {mint_token('cust-1001', 'main-street-market')}"},
+        )
+    assert response.status_code == 200
+    trace: list[dict[str, Any]] = response.json()["trace"]
+    return trace
+
+
+@pytest.mark.usefixtures("orders_database")
+def test_chat_returns_every_attempt_of_a_retried_tool_call(
+    script_model: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script_model("lookup_order_status", {"order_id": "ORD-1042"})
+    _rolls(monkeypatch, 0.1, 0.1)  # fail, fail, succeed
+    *attempts, final = _chat_trace()
+    assert [(entry["type"], entry["success"]) for entry in attempts] == [
+        ("tool_call", False),
+        ("tool_call", False),
+        ("tool_call", True),
+    ]
+    assert len({entry["tool_call_id"] for entry in attempts}) == 1  # one call, three attempts
+    assert attempts[0]["error_type"] == "TransientToolError"
+    assert attempts[-1]["output"].startswith("order ORD-1042")
+    assert (final["type"], final["text"]) == ("final_answer", "done")
+
+
+def test_chat_trace_leaves_out_an_errors_internal_detail(
+    script_model: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script_model("lookup_order_status", {"order_id": "ORD-1042"})
+
+    def broken(*args: Any, **kwargs: Any) -> str:
+        raise RuntimeError("connection to postgres://admin:hunter2@db failed")
+
+    monkeypatch.setattr("agent_service.langchain.tools.lookup_order_status", broken)
+    trace = _chat_trace()
+    assert trace[0]["error_type"] == "RuntimeError"
+    assert "hunter2" not in str(trace)

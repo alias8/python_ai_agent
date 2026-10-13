@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -17,3 +19,8 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     trace_file: str
+    # This run's entries from the JSONL trace, in the order they happened:
+    # one "tool_call" per attempt (so a retried call appears several times,
+    # sharing a tool_call_id), then the "final_answer". A failed attempt
+    # carries its exception's type, not its message.
+    trace: list[dict[str, Any]]

@@ -51,6 +51,7 @@ def test_chat_runs_the_agent_as_the_tokens_customer_and_store(
     body = response.json()
     assert body["answer"] == "mocked answer"
     assert "trace_file" in body
+    assert body["trace"] == []  # the agent run is mocked out, so nothing was traced
     assert seen_by_agent["context"] == AgentContext(customer_id="cust-1001", store_id="main-street-market")
 
 

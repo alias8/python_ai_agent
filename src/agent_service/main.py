@@ -8,7 +8,7 @@ from .langchain.context import AgentContext
 from .langchain.kb_corpus import store_ids
 from .schemas import ChatRequest, ChatResponse
 from .shared.auth import AuthError, Principal, verify_token
-from .shared.trace import get_trace_file_path
+from .shared.trace import capture_trace, get_trace_file_path, without_error_detail
 
 app = FastAPI(
     title="Agent Service",
@@ -56,5 +56,8 @@ async def chat(
         # deep inside the agent run.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     context = AgentContext(customer_id=principal.customer_id, store_id=principal.store_id)
-    answer = await run_agent(request.message, context=context, allowed_tools=request.allowed_tools)
-    return ChatResponse(answer=answer, trace_file=str(get_trace_file_path()))
+    with capture_trace() as trace:
+        answer = await run_agent(request.message, context=context, allowed_tools=request.allowed_tools)
+    return ChatResponse(
+        answer=answer, trace_file=str(get_trace_file_path()), trace=without_error_detail(trace)
+    )

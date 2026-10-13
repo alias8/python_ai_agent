@@ -61,6 +61,7 @@ def _traced(name: str, model: type[Any], func: Callable[[Any, ToolRuntime[AgentC
                 duration_ms=int((time.monotonic() - start) * 1000),
                 success=not output.startswith("Error"),
                 attempts=1,
+                tool_call_id=runtime.tool_call_id,
                 output=output,
             )
             return str(output)
@@ -72,7 +73,9 @@ def _traced(name: str, model: type[Any], func: Callable[[Any, ToolRuntime[AgentC
                 duration_ms=int((time.monotonic() - start) * 1000),
                 success=False,
                 attempts=1,
+                tool_call_id=runtime.tool_call_id,
                 error=str(exc),
+                error_type=type(exc).__name__,
             )
             raise
 

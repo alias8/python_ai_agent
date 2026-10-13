@@ -1,4 +1,7 @@
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -17,10 +20,40 @@ def get_trace_file_path() -> Path:
     return _TRACE_FILE
 
 
+# The entries of the run in progress, when someone asked for them with
+# capture_trace(). A ContextVar rather than a global so concurrent requests
+# each collect their own: LangGraph copies the context into the worker
+# threads it runs sync tools on, and the copies all point at the same list.
+_captured: ContextVar[list[dict[str, Any]] | None] = ContextVar("captured_trace", default=None)
+
+
+@contextmanager
+def capture_trace() -> Iterator[list[dict[str, Any]]]:
+    """Collects every entry traced inside the block, as well as writing it to
+    the file — so /chat can return what its own run did."""
+    entries: list[dict[str, Any]] = []
+    token = _captured.set(entries)
+    try:
+        yield entries
+    finally:
+        _captured.reset(token)
+
+
+def without_error_detail(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The entries as they can be shown to the customer: an exception's
+    message can carry internal detail (a SQL statement, a connection string),
+    so only its type leaves the server — the same rule agent.py applies to
+    what the model sees. The message stays in the trace file."""
+    return [{key: value for key, value in entry.items() if key != "error"} for entry in entries]
+
+
 def _write(entry: dict[str, Any]) -> None:
-    line = json.dumps({"timestamp": datetime.now(UTC).isoformat(), **entry})
+    stamped = {"timestamp": datetime.now(UTC).isoformat(), **entry}
     with _TRACE_FILE.open("a") as f:
-        f.write(line + "\n")
+        f.write(json.dumps(stamped) + "\n")
+    captured = _captured.get()
+    if captured is not None:
+        captured.append(stamped)
 
 
 def trace_tool_call(
@@ -33,11 +66,16 @@ def trace_tool_call(
     attempts: int,
     output: str | None = None,
     error: str | None = None,
+    error_type: str | None = None,
+    tool_call_id: str | None = None,
 ) -> None:
     _write(
         {
             "type": "tool_call",
             "iteration": iteration,
+            # The model's ID for this call. A retried call is traced once per
+            # attempt, and every attempt carries the same ID.
+            "tool_call_id": tool_call_id,
             "tool": tool,
             "input": input,
             "duration_ms": duration_ms,
@@ -45,6 +83,7 @@ def trace_tool_call(
             "attempts": attempts,
             "output": output,
             "error": error,
+            "error_type": error_type,
         }
     )
 
