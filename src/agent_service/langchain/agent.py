@@ -13,7 +13,7 @@ crashes the run — which by default, in LangGraph's Python ToolNode, it
 would. See the README.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from functools import lru_cache
 from typing import Any
 
@@ -33,7 +33,7 @@ from ..shared.config import get_settings
 from ..shared.exceptions import TransientToolError
 from ..shared.trace import trace_api_error, trace_final_answer, trace_max_iterations
 from .context import AgentContext
-from .tools import LANGCHAIN_TOOLS, reset_call_sequence
+from .tools import LANGCHAIN_TOOLS, TOOL_SCOPES, reset_call_sequence
 
 # LangGraph's own default. It counts each graph "super-step" (roughly: one
 # model call, or one batch of tool executions), not one full
@@ -124,6 +124,14 @@ def select_tools(allowed_tools: Sequence[str] | None) -> tuple[str, ...]:
     if unknown:
         raise ValueError(f"unknown tool(s) in allowed_tools: {', '.join(unknown)}")
     return tuple(name for name in _TOOLS_BY_NAME if name in allowed_tools)
+
+
+def tools_for_scopes(scopes: Iterable[str]) -> tuple[str, ...]:
+    """The tools a token's scopes grant. A scope this service doesn't know is
+    ignored rather than rejected: a token can carry scopes meant for other
+    services. A tool whose scope is missing is never given to the agent."""
+    granted = set(scopes)
+    return tuple(name for name in _TOOLS_BY_NAME if TOOL_SCOPES[name] in granted)
 
 
 @lru_cache

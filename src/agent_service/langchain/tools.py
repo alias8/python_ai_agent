@@ -132,6 +132,14 @@ send_notification_tool: BaseTool = tool(
     )
 )
 
+# The token scope (shared/auth.py) that grants each tool. A /chat run gets
+# only the tools its token's scopes grant — see agent.tools_for_scopes().
+TOOL_SCOPES: dict[str, str] = {
+    "lookup_order_status": "orders:read",
+    "search_knowledge_base": "kb:read",
+    "send_notification": "notifications:send",
+}
+
 LANGCHAIN_TOOLS: list[BaseTool] = [
     lookup_order_status_tool,
     search_knowledge_base_tool,

@@ -39,7 +39,7 @@ src/agent_service/
     kb_models.py       the kb_chunks table (SQLAlchemy + pgvector + a full-text tsvector column)
     kb_ingest.py       embeds chunks into Postgres, incrementally
     context.py         AgentContext: who is asking (customer + store), supplied by the server, never the model
-    agent.py           the agent loop via create_agent(), with a per-request tool allowlist
+    agent.py           the agent loop via create_agent(), given only the tools the token's scopes grant
     cli.py             REPL entry point
   schemas.py        API request/response models
   main.py           FastAPI app (/health, /chat)
@@ -56,7 +56,7 @@ A customer-support flavor rather than ai-agent-demo's calculator/weather/units. 
 - `search_knowledge_base(query)` — semantic (embedding-based) search over the knowledge base — see below
 - `send_notification(message)` — a mock action tool with a side effect, independently flaky (~30%); always notifies the signed-in customer, and delivers at most once per tool call (idempotency key) however often it's retried
 
-`/chat` takes the message and an optional `allowed_tools` allowlist; who is asking comes from the bearer token (see below). It's enforced by building the agent with only those tools, so Claude never sees the others' schemas; an unknown tool name is a 422.
+`/chat` takes only the message. Who is asking, and which tools the agent may use, come from the bearer token (see below). Each tool needs a scope — `orders:read`, `kb:read` or `notifications:send` (`TOOL_SCOPES` in `langchain/tools.py`) — and the storefront decides which scopes a customer's token carries: a guest who hasn't signed in might get only `kb:read`. It's enforced by building the agent with only the granted tools, so Claude never sees the others' schemas. A scope this service doesn't know is ignored, since a token can carry scopes meant for other services. The browser can't widen or narrow the set: `allowed_tools` in the body is a 422, like any other extra field.
 
 ## How langchain/ works
 
@@ -151,12 +151,12 @@ Retrieval roadmap, each step measured against this eval: ~~chunking~~ (done) →
 
 An LLM agent's tools act on someone's behalf, and "whose" is the security question. The rule throughout: **identity comes from the server, never from the model.** Anything in a tool's schema is something the model chooses — and so something a prompt injection can choose.
 
-- **Authentication — `/chat` requires a customer JWT** (`Authorization: Bearer ...`). This service doesn't log customers in: the storefront does, and issues a short-lived HS256 token carrying the customer (`sub`) and store (`store_id`), signed with a secret the two services share (`JWT_SECRET`, required, at least 32 characters, or startup fails). Verification pins the algorithm (a token's own `alg: none` header can't pick it), requires `exp`, `sub`, `aud`, and `store_id`, and checks the audience so a token issued for another service can't be replayed here. Every failure is the same 401. The request body can't carry identity at all — `ChatRequest` forbids extra fields, so a `store_id` or `customer_id` in the body is a 422, not silently trusted or ignored.
+- **Authentication — `/chat` requires a customer JWT** (`Authorization: Bearer ...`). This service doesn't log customers in: the storefront does, and issues a short-lived HS256 token carrying the customer (`sub`) and store (`store_id`), signed with a secret the two services share (`JWT_SECRET`, required, at least 32 characters, or startup fails). Verification pins the algorithm (a token's own `alg: none` header can't pick it), requires `exp`, `sub`, `aud`, `store_id` and `scope`, and checks the audience so a token issued for another service can't be replayed here. Every failure is the same 401. The request body can't carry identity or tool access at all — `ChatRequest` forbids extra fields, so a `store_id`, `customer_id` or `allowed_tools` in the body is a 422, not silently trusted or ignored.
 - **The customer reaches tools only through `AgentContext`** — the same server-supplied run context tenant filtering uses, handed to tools as a `ToolRuntime` parameter that isn't in any schema Claude sees. `lookup_order_status` takes only `order_id`; `send_notification` takes only `message` (it used to take a `user_id`, which let the model message anyone — the same bug in a different tool).
 - **Ownership is part of the query.** `find_customer_order` selects `WHERE id = ? AND customer_id = ? AND store_id = ?`: there's no code path that fetches another customer's order and then has to remember to check it.
 - **Not yours looks exactly like doesn't exist.** Another customer's order and a made-up ID get the identical `no order found` reply, so the tool can't be used to discover which order IDs exist — and the model has nothing to be talked into revealing.
 
-`tests/test_order_authorization.py` drives a real `create_agent()` run with a scripted model that forges `customer_id` and `user_id` arguments to reach another customer's order and inbox; both are dropped, and the tools act as the context's customer. `tests/test_api.py` covers missing, garbage, wrong-signature, expired, wrong-audience, `alg: none`, unknown-store, and missing-claim tokens (each a 401, with the agent never running) and identity fields in the body (422).
+`tests/test_order_authorization.py` drives a real `create_agent()` run with a scripted model that forges `customer_id` and `user_id` arguments to reach another customer's order and inbox; both are dropped, and the tools act as the context's customer. `tests/test_api.py` covers missing, garbage, wrong-signature, expired, wrong-audience, `alg: none`, unknown-store, and missing-claim tokens (each a 401, with the agent never running), identity or tool fields in the body (422), and a scoped token reaching the agent with only its granted tools.
 
 Sample orders (`python -m agent_service.shared.orders`): `cust-1001` owns `ORD-1001` and `ORD-1042`, `cust-2002` owns `ORD-2003` (all at `main-street-market`), and `cust-3003` owns `PNP-5001` at `pine-and-peak`.
 
@@ -191,7 +191,7 @@ python -m agent_service.shared.orders         # seed sample orders
 # HTTP API
 uvicorn agent_service.main:app --reload
 # then, with a token for a sample customer (normally the storefront issues these):
-TOKEN=$(python -m agent_service.shared.auth --customer cust-1001 --store main-street-market)
+TOKEN=$(python -m agent_service.shared.auth --customer cust-1001 --store main-street-market)   # add --scope kb:read for a guest
 curl -s localhost:8000/chat -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"message": "where is my order ORD-1042?"}'
 # the response carries the run's trace entries as well as the answer: one per tool-call attempt
@@ -214,7 +214,7 @@ python -m evals.kb_eval  # retrieval quality report (not run in CI — it report
 
 All three run in CI on every push/PR (`.github/workflows/ci.yml`), which caches both pip packages and the downloaded embedding model (`actions/cache` on `~/.cache/huggingface`) to keep runs fast after the first. No `ANTHROPIC_API_KEY` or paid API call is needed for any of it — no test calls Claude — but the tests do need the Postgres container running (`docker compose up -d`; CI runs the same image as a service container) — they migrate and use a separate `agent_service_test` database, never dev data — and `tests/test_knowledge_base.py` loads a real `sentence-transformers` model and runs it against real pgvector search (network needed once, to populate a cold Hugging Face cache; local after that), because retrieval *quality* — does it actually find a keyword-free paraphrase, does it actually reject an irrelevant query — is the entire point of that module and can't be demonstrated with a mock.
 
-There's no automated test for a full `create_agent()` run (mocking LangGraph's internals deep enough to be worth it wasn't — the tool-failure finding above was verified with a one-off scripted fake model instead, not committed as a test); the tool allowlist, `/chat`, and `langchain/knowledge_base.py`'s retrieval are unit-tested like everything else.
+There's no automated test for a full `create_agent()` run (mocking LangGraph's internals deep enough to be worth it wasn't — the tool-failure finding above was verified with a one-off scripted fake model instead, not committed as a test); tool scoping, `/chat`, and `langchain/knowledge_base.py`'s retrieval are unit-tested like everything else.
 
 ## Status
 

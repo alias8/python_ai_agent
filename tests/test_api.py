@@ -6,9 +6,10 @@ import jwt
 import pytest
 from fastapi.testclient import TestClient
 
+from agent_service.langchain.agent import tools_for_scopes
 from agent_service.langchain.context import AgentContext
 from agent_service.main import app
-from agent_service.shared.auth import mint_token
+from agent_service.shared.auth import ALL_SCOPES, mint_token
 
 
 @pytest.fixture
@@ -53,6 +54,8 @@ def test_chat_runs_the_agent_as_the_tokens_customer_and_store(
     assert "trace_file" in body
     assert body["trace"] == []  # the agent run is mocked out, so nothing was traced
     assert seen_by_agent["context"] == AgentContext(customer_id="cust-1001", store_id="main-street-market")
+    # mint_token's default is every scope, so every tool
+    assert seen_by_agent["allowed_tools"] == tools_for_scopes(ALL_SCOPES)
 
 
 def test_chat_rejects_empty_message(client: TestClient) -> None:
@@ -60,25 +63,23 @@ def test_chat_rejects_empty_message(client: TestClient) -> None:
     assert response.status_code == 422
 
 
-def test_chat_passes_allowlist_to_agent(client: TestClient, seen_by_agent: dict[str, Any]) -> None:
-    response = client.post(
-        "/chat", json={"message": "hi", "allowed_tools": ["search_knowledge_base"]}, headers=CUST_1001
-    )
+def test_chat_gives_the_agent_only_the_tools_the_token_grants(
+    client: TestClient, seen_by_agent: dict[str, Any]
+) -> None:
+    guest = _auth(mint_token("guest-4004", "main-street-market", scopes=["kb:read"]))
+    response = client.post("/chat", json={"message": "where is ORD-1042?"}, headers=guest)
     assert response.status_code == 200
-    assert seen_by_agent["allowed_tools"] == ["search_knowledge_base"]
+    assert seen_by_agent["allowed_tools"] == ("search_knowledge_base",)
 
 
-def test_chat_rejects_unknown_tool_in_allowlist(client: TestClient) -> None:
-    response = client.post(
-        "/chat", json={"message": "hi", "allowed_tools": ["delete_everything"]}, headers=CUST_1001
-    )
-    assert response.status_code == 422
-    assert "delete_everything" in response.json()["detail"]
-
-
-@pytest.mark.parametrize("field", ["store_id", "customer_id"])
-def test_identity_in_the_body_is_rejected_not_trusted(client: TestClient, field: str) -> None:
-    response = client.post("/chat", json={"message": "hi", field: "cust-2002"}, headers=CUST_1001)
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("store_id", "pine-and-peak"), ("customer_id", "cust-2002"), ("allowed_tools", ["send_notification"])],
+)
+def test_identity_or_tools_in_the_body_are_rejected_not_trusted(
+    client: TestClient, field: str, value: Any
+) -> None:
+    response = client.post("/chat", json={"message": "hi", field: value}, headers=CUST_1001)
     assert response.status_code == 422
 
 
@@ -91,6 +92,7 @@ def test_chat_requires_a_token(client: TestClient) -> None:
 _VALID_CLAIMS = {
     "sub": "cust-2002",
     "store_id": "main-street-market",
+    "scope": "orders:read kb:read notifications:send",
     "aud": "agent-service",
     "exp": 4102444800,  # 2100-01-01
 }
@@ -117,11 +119,9 @@ def test_chat_rejects_bad_tokens(client: TestClient, seen_by_agent: dict[str, An
     assert seen_by_agent == {}  # the agent never ran
 
 
-def test_token_missing_the_store_claim_is_rejected(client: TestClient) -> None:
-    token = jwt.encode(
-        {"sub": "cust-1001", "aud": "agent-service", "exp": 4102444800},
-        "test-jwt-secret-not-for-production-use",
-        algorithm="HS256",
-    )
+@pytest.mark.parametrize("claim", ["store_id", "scope"])
+def test_token_missing_a_required_claim_is_rejected(client: TestClient, claim: str) -> None:
+    claims = {key: value for key, value in _VALID_CLAIMS.items() if key != claim}
+    token = jwt.encode(claims, "test-jwt-secret-not-for-production-use", algorithm="HS256")
     response = client.post("/chat", json={"message": "hi"}, headers=_auth(token))
     assert response.status_code == 401

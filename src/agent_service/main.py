@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from .langchain.agent import run_agent, select_tools
+from .langchain.agent import run_agent, tools_for_scopes
 from .langchain.context import AgentContext
 from .langchain.kb_corpus import store_ids
 from .schemas import ChatRequest, ChatResponse
@@ -49,15 +49,13 @@ async def health() -> dict[str, str]:
 async def chat(
     request: ChatRequest, principal: Annotated[Principal, Depends(current_principal)]
 ) -> ChatResponse:
-    try:
-        select_tools(request.allowed_tools)
-    except ValueError as exc:
-        # A bad allowlist is the caller's mistake, so a 422, not a 500 from
-        # deep inside the agent run.
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
     context = AgentContext(customer_id=principal.customer_id, store_id=principal.store_id)
+    # Which tools the agent gets comes from the token's scopes, like the
+    # customer and store: the storefront decides, never the request body.
     with capture_trace() as trace:
-        answer = await run_agent(request.message, context=context, allowed_tools=request.allowed_tools)
+        answer = await run_agent(
+            request.message, context=context, allowed_tools=tools_for_scopes(principal.scopes)
+        )
     return ChatResponse(
         answer=answer, trace_file=str(get_trace_file_path()), trace=without_error_detail(trace)
     )

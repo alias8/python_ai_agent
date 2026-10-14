@@ -1,6 +1,8 @@
 import pytest
 
-from agent_service.langchain.agent import select_tools
+from agent_service.langchain.agent import select_tools, tools_for_scopes
+from agent_service.langchain.tools import TOOL_SCOPES
+from agent_service.shared.auth import ALL_SCOPES
 
 ALL_TOOLS = ("lookup_order_status", "search_knowledge_base", "send_notification")
 
@@ -20,3 +22,28 @@ def test_select_tools_empty_allowlist_means_no_tools() -> None:
 def test_select_tools_rejects_unknown_names() -> None:
     with pytest.raises(ValueError, match="delete_everything"):
         select_tools(["search_knowledge_base", "delete_everything"])
+
+
+def test_every_scope_grants_every_tool() -> None:
+    assert tools_for_scopes(ALL_SCOPES) == ALL_TOOLS
+
+
+def test_scopes_grant_only_their_own_tools() -> None:
+    assert tools_for_scopes(["kb:read"]) == ("search_knowledge_base",)
+    assert tools_for_scopes(["orders:read", "notifications:send"]) == (
+        "lookup_order_status",
+        "send_notification",
+    )
+
+
+def test_no_scopes_means_no_tools() -> None:
+    assert tools_for_scopes([]) == ()
+
+
+def test_scopes_for_other_services_are_ignored() -> None:
+    assert tools_for_scopes(["kb:read", "billing:write"]) == ("search_knowledge_base",)
+
+
+def test_every_tool_has_a_known_scope() -> None:
+    assert set(TOOL_SCOPES) == set(ALL_TOOLS)
+    assert set(TOOL_SCOPES.values()) == set(ALL_SCOPES)
